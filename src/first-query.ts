@@ -1,5 +1,5 @@
 import { SHOP, CLIENT_ID, CLIENT_SECRET, API_VERSION } from './config.js';
-import type { TokenResponse, ProductsResponse } from './types.js';
+import { TokenResponseSchema, ProductsResponseSchema } from './types.js';
 
 async function getAccessToken(): Promise<string> {
   const res = await fetch(`https://${SHOP}/admin/oauth/access_token`, {
@@ -16,8 +16,15 @@ async function getAccessToken(): Promise<string> {
     throw new Error(`Token request failed: ${res.status} ${await res.text()}`);
   }
 
-  const data = (await res.json()) as TokenResponse;
-  return data.access_token;
+  const parsed = TokenResponseSchema.safeParse(await res.json());
+
+  if (!parsed.success) {
+    throw new Error(
+      `Unexpected token response shape:\n${JSON.stringify(parsed.error.issues, null, 2)}`
+    );
+  }
+
+  return parsed.data.access_token;
 }
 
 const QUERY = `
@@ -52,7 +59,17 @@ async function main(): Promise<void> {
     }
   );
 
-  const json = (await res.json()) as ProductsResponse;
+  const parsed = ProductsResponseSchema.safeParse(await res.json());
+
+  if (!parsed.success) {
+    console.error(
+      'Response did not match expected shape:',
+      JSON.stringify(parsed.error.issues, null, 2)
+    );
+    return;
+  }
+
+  const json = parsed.data;
 
   if (json.errors || !json.data) {
     console.error('GraphQL errors:', JSON.stringify(json.errors, null, 2));
