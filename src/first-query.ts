@@ -5,6 +5,30 @@ const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID!;
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET!;
 const API_VERSION = '2026-07';
 
+interface TokenResponse {
+  access_token: string;
+  expires_in?: number;
+}
+
+interface ProductNode {
+  id: string;
+  title: string;
+  variants: {
+    edges: Array<{
+      node: { sku: string | null; inventoryQuantity: number | null };
+    }>;
+  };
+}
+
+interface ProductsResponse {
+  data?: {
+    products: {
+      edges: Array<{ node: ProductNode }>;
+    };
+  };
+  errors?: unknown;
+}
+
 async function getAccessToken(): Promise<string> {
   const res = await fetch(`https://${SHOP}/admin/oauth/access_token`, {
     method: 'POST',
@@ -20,7 +44,7 @@ async function getAccessToken(): Promise<string> {
     throw new Error(`Token request failed: ${res.status} ${await res.text()}`);
   }
 
-  const data = await res.json();
+  const data = (await res.json()) as TokenResponse;
   return data.access_token;
 }
 
@@ -40,7 +64,7 @@ const QUERY = `
   }
 `;
 
-async function main() {
+async function main(): Promise<void> {
   const token = await getAccessToken();
   console.log('Access token acquired');
 
@@ -56,9 +80,9 @@ async function main() {
     }
   );
 
-  const json = await res.json();
+  const json = (await res.json()) as ProductsResponse;
 
-  if (json.errors) {
+  if (json.errors || !json.data) {
     console.error('GraphQL errors:', JSON.stringify(json.errors, null, 2));
     return;
   }
