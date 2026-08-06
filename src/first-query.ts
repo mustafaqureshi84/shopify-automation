@@ -1,60 +1,6 @@
-import { getConfig } from './config.js';
-import { TokenResponseSchema, ProductsResponseSchema } from './types.js';
+import { shopifyGraphQL } from './shopify.js';
+import { ProductsResponseSchema } from './types.js';
 import { ConfigError, ShopifyAuthError, ShopifyApiError } from './errors.js';
-
-async function summarizeErrorBody(res: Response): Promise<string> {
-  const contentType = res.headers.get('content-type') ?? '';
-  const requestId = res.headers.get('x-request-id');
-  const raw = await res.text();
-
-  let detail: string;
-
-  if (contentType.includes('application/json')) {
-    detail = raw.slice(0, 500);
-  } else {
-    detail = raw
-      .replace(/<(style|script)[\s\S]*?<\/\1>/gi, ' ')
-      .replace(/<[^>]*>/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, 300);
-  }
-
-  return requestId ? `${detail}\n(request id: ${requestId})` : detail;
-}
-
-async function getAccessToken(): Promise<string> {
-  const { shop, clientId, clientSecret } = getConfig();
-
-  const res = await fetch(`https://${shop}/admin/oauth/access_token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      client_id: clientId,
-      client_secret: clientSecret,
-      grant_type: 'client_credentials',
-    }),
-  });
-
-  if (!res.ok) {
-    throw new ShopifyAuthError(
-      `Token request failed with status ${res.status}`,
-      res.status,
-      await summarizeErrorBody(res)
-    );
-  }
-
-  const parsed = TokenResponseSchema.safeParse(await res.json());
-
-  if (!parsed.success) {
-    throw new ShopifyApiError(
-      'Token response did not match expected shape',
-      parsed.error.issues
-    );
-  }
-
-  return parsed.data.access_token;
-}
 
 const QUERY = `
   query FirstProducts {
@@ -73,30 +19,8 @@ const QUERY = `
 `;
 
 async function main(): Promise<void> {
-  const { shop, apiVersion } = getConfig();
-  const token = await getAccessToken();
-  console.log('Access token acquired');
-
-  const res = await fetch(
-    `https://${shop}/admin/api/${apiVersion}/graphql.json`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': token,
-      },
-      body: JSON.stringify({ query: QUERY }),
-    }
-  );
-
-  if (!res.ok) {
-    throw new ShopifyApiError(
-      `Admin API request failed with status ${res.status}`,
-      await summarizeErrorBody(res)
-    );
-  }
-
-  const parsed = ProductsResponseSchema.safeParse(await res.json());
+  const { body, cost } = await shopifyGraphQL(QUERY);
+  const parsed = ProductsResponseSchema.safeParse(body);
 
   if (!parsed.success) {
     throw new ShopifyApiError(
@@ -117,6 +41,13 @@ async function main(): Promise<void> {
 
   for (const { node } of json.data.products.edges) {
     console.log(`${node.title} — ${node.variants.edges.length} variants`);
+  }
+
+  if (cost) {
+    console.log(
+      `\nThrottle: ${cost.currentlyAvailable}/${cost.maximumAvailable} ` +
+        `(restores ${cost.restoreRate}/sec)`
+    );
   }
 }
 
