@@ -1,33 +1,5 @@
-import 'dotenv/config';
-
-const SHOP = process.env.SHOP_DOMAIN!;
-const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID!;
-const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET!;
-const API_VERSION = '2026-07';
-
-interface TokenResponse {
-  access_token: string;
-  expires_in?: number;
-}
-
-interface ProductNode {
-  id: string;
-  title: string;
-  variants: {
-    edges: Array<{
-      node: { sku: string | null; inventoryQuantity: number | null };
-    }>;
-  };
-}
-
-interface ProductsResponse {
-  data?: {
-    products: {
-      edges: Array<{ node: ProductNode }>;
-    };
-  };
-  errors?: unknown;
-}
+import { SHOP, CLIENT_ID, CLIENT_SECRET, API_VERSION } from './config.js';
+import type { TokenResponse, ProductsResponse } from './types.js';
 
 async function getAccessToken(): Promise<string> {
   const res = await fetch(`https://${SHOP}/admin/oauth/access_token`, {
