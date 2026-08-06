@@ -1,5 +1,6 @@
 import { getConfig } from './config.js';
 import { ShopifyAuthError, ShopifyApiError } from './errors.js';
+import { withRetry, RetryableHttpError } from './retry.js';
 import { TokenResponseSchema, ThrottleEnvelopeSchema } from './types.js';
 import type { ThrottleStatus } from './types.js';
 
@@ -26,6 +27,23 @@ export async function summarizeErrorBody(res: Response): Promise<string> {
   return requestId ? `${detail}\n(request id: ${requestId})` : detail;
 }
 
+function parseRetryAfter(res: Response): number | null {
+  const header = res.headers.get('retry-after');
+  if (!header) return null;
+
+  const seconds = Number(header);
+  if (Number.isFinite(seconds)) return Math.round(seconds * 1000);
+
+  const when = Date.parse(header);
+  if (Number.isNaN(when)) return null;
+
+  return Math.max(0, when - Date.now());
+}
+
+function isTransientStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
 export async function getAccessToken(): Promise<string> {
   if (cachedToken && Date.now() < cachedToken.expiresAt) {
     return cachedToken.value;
@@ -33,38 +51,55 @@ export async function getAccessToken(): Promise<string> {
 
   const { shop, clientId, clientSecret } = getConfig();
 
-  const res = await fetch(`https://${shop}/admin/oauth/access_token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      client_id: clientId,
-      client_secret: clientSecret,
-      grant_type: 'client_credentials',
-    }),
-  });
+  const parsed = await withRetry(
+    async () => {
+      const res = await fetch(`https://${shop}/admin/oauth/access_token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_id: clientId,
+          client_secret: clientSecret,
+          grant_type: 'client_credentials',
+        }),
+      });
 
-  if (!res.ok) {
-    throw new ShopifyAuthError(
-      `Token request failed with status ${res.status}`,
-      res.status,
-      await summarizeErrorBody(res)
-    );
-  }
+      if (!res.ok) {
+        const detail = await summarizeErrorBody(res);
 
-  const parsed = TokenResponseSchema.safeParse(await res.json());
+        if (isTransientStatus(res.status)) {
+          throw new RetryableHttpError(
+            `Token request failed with status ${res.status}`,
+            res.status,
+            parseRetryAfter(res)
+          );
+        }
 
-  if (!parsed.success) {
-    throw new ShopifyApiError(
-      'Token response did not match expected shape',
-      parsed.error.issues
-    );
-  }
+        throw new ShopifyAuthError(
+          `Token request failed with status ${res.status}`,
+          res.status,
+          detail
+        );
+      }
 
-  const lifetimeSeconds = parsed.data.expires_in ?? 86_400;
+      const result = TokenResponseSchema.safeParse(await res.json());
+
+      if (!result.success) {
+        throw new ShopifyApiError(
+          'Token response did not match expected shape',
+          result.error.issues
+        );
+      }
+
+      return result.data;
+    },
+    { label: 'token request' }
+  );
+
+  const lifetimeSeconds = parsed.expires_in ?? 86_400;
   const safetyMarginSeconds = 300;
 
   cachedToken = {
-    value: parsed.data.access_token,
+    value: parsed.access_token,
     expiresAt: Date.now() + (lifetimeSeconds - safetyMarginSeconds) * 1000,
   };
 
@@ -83,30 +118,45 @@ export async function shopifyGraphQL(
   const { shop, apiVersion } = getConfig();
   const token = await getAccessToken();
 
-  const res = await fetch(
-    `https://${shop}/admin/api/${apiVersion}/graphql.json`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': token,
-      },
-      body: JSON.stringify(variables ? { query, variables } : { query }),
-    }
+  return withRetry(
+    async () => {
+      const res = await fetch(
+        `https://${shop}/admin/api/${apiVersion}/graphql.json`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Shopify-Access-Token': token,
+          },
+          body: JSON.stringify(variables ? { query, variables } : { query }),
+        }
+      );
+
+      if (!res.ok) {
+        if (isTransientStatus(res.status)) {
+          throw new RetryableHttpError(
+            `Admin API request failed with status ${res.status}`,
+            res.status,
+            parseRetryAfter(res)
+          );
+        }
+
+        throw new ShopifyApiError(
+          `Admin API request failed with status ${res.status}`,
+          await summarizeErrorBody(res)
+        );
+      }
+
+      const body: unknown = await res.json();
+      const envelope = ThrottleEnvelopeSchema.safeParse(body);
+
+      return {
+        body,
+        cost: envelope.success
+          ? envelope.data.extensions.cost.throttleStatus
+          : null,
+      };
+    },
+    { label: 'admin graphql' }
   );
-
-  if (!res.ok) {
-    throw new ShopifyApiError(
-      `Admin API request failed with status ${res.status}`,
-      await summarizeErrorBody(res)
-    );
-  }
-
-  const body: unknown = await res.json();
-  const envelope = ThrottleEnvelopeSchema.safeParse(body);
-
-  return {
-    body,
-    cost: envelope.success ? envelope.data.extensions.cost.throttleStatus : null,
-  };
 }

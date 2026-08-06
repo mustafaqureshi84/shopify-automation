@@ -2,6 +2,7 @@ import { shopifyGraphQL } from './shopify.js';
 import { ProductIdListSchema, ProductInventorySchema } from './types.js';
 import { ConfigError, ShopifyAuthError, ShopifyApiError } from './errors.js';
 import type { ThrottleStatus } from './types.js';
+import { RetryExhaustedError } from './retry.js';
 
 const PRODUCT_IDS_QUERY = `
   query ProductIds {
@@ -176,6 +177,14 @@ main().catch((err: unknown) => {
   if (err instanceof ConfigError) {
     console.error(`[config] ${err.message}`);
     process.exit(78);
+  }
+
+  if (err instanceof RetryExhaustedError) {
+    console.error(`[retry] ${err.message}`);
+    if (err.lastError instanceof Error) {
+      console.error(`  last error: ${err.lastError.message}`);
+    }
+    process.exit(75);
   }
 
   if (err instanceof ShopifyAuthError) {
