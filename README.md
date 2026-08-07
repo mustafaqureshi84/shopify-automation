@@ -28,7 +28,7 @@ A learning project for building reliable Shopify integrations against the GraphQ
 
 Permanent `shpat_` tokens are no longer issued from the Shopify admin. Tokens are requested at runtime via the client credentials grant and are valid for 24 hours.
 
-**Scope changes require reinstalling the app.** Releasing a new version updates the app's declared scopes, but an existing installation retains the grant it was authorized under. Tokens are issued against the installation, not the latest version. Run `check-scopes.ts` to see what a token actually holds.
+**Scope changes require reinstalling the app.** Releasing a new version updates the app's declared scopes, but an existing installation retains the grant it was authorized under, and tokens are issued against the installation. Run `check-scopes.ts` to see what a token actually holds.
 
 ### Install
 
@@ -51,18 +51,22 @@ SHOPIFY_CLIENT_SECRET=
 ## Scripts
 
 ```bash
-npx tsx src/check-scopes.ts      # what scopes does this token actually have
-npx tsx src/first-query.ts       # minimal single query — 10 products
-npx tsx src/export-products.ts   # full catalog via cursor pagination
-npx tsx src/async-patterns.ts    # concurrency benchmark, 4 strategies
-npx tsx src/inventory-report.ts  # per-location stock, quantity-name audit
-npx tsx src/metafields.ts        # definition lifecycle, mutations, idempotency proof
+npx tsx src/check-scopes.ts        # what scopes does this token actually have
+npx tsx src/first-query.ts         # minimal single query — 10 products
+npx tsx src/export-products.ts     # full catalog via cursor pagination
+npx tsx src/async-patterns.ts      # concurrency benchmark, 4 strategies
+npx tsx src/inventory-report.ts    # per-location stock, quantity-name audit
+npx tsx src/metafields.ts          # definition lifecycle, mutations, idempotency proof
+npx tsx src/generate-products.ts   # create synthetic catalog data
+npx tsx src/teardown-products.ts   # delete generated data (requires CONFIRM=yes)
 ```
 
-`export-products.ts` accepts `PAGE_SIZE`:
+Environment overrides:
 
 ```bash
-PAGE_SIZE=250 npx tsx src/export-products.ts
+PAGE_SIZE=250                      # export-products.ts page size
+COUNT=2000 START_AT=21 SEED=42     # generate-products.ts
+CONFIRM=yes                        # teardown-products.ts safety gate
 ```
 
 ## Structure
@@ -72,7 +76,7 @@ PAGE_SIZE=250 npx tsx src/export-products.ts
 | `src/config.ts` | Reads and validates env vars; memoized, throws `ConfigError` naming every missing variable |
 | `src/errors.ts` | `ConfigError`, `ShopifyAuthError`, `ShopifyApiError` |
 | `src/retry.ts` | `withRetry` with exponential backoff and jitter; `RetryExhaustedError` |
-| `src/exit.ts` | Maps any thrown error to a log line and exit code |
+| `src/exit.ts` | `describeError` renders any thrown value; `handleFatal` adds the exit code |
 | `src/rate-limiter.ts` | Leaky-bucket model; gates requests, tracks cost, derives concurrency |
 | `src/shopify.ts` | Transport layer — the only file that calls `fetch` |
 | `src/mutations.ts` | Write path: `userErrors` handling, idempotency classification, `requireData` |
@@ -84,6 +88,8 @@ PAGE_SIZE=250 npx tsx src/export-products.ts
 | `src/async-patterns.ts` | Script: concurrency benchmark |
 | `src/inventory-report.ts` | Script: location and inventory-level traversal |
 | `src/metafields.ts` | Script: metafield definitions and idempotent writes |
+| `src/generate-products.ts` | Script: synthetic catalog generation via atomic `productSet` |
+| `src/teardown-products.ts` | Script: tag-scoped deletion of generated data |
 
 Dependencies flow one direction. `types.ts` and `errors.ts` have no dependencies; scripts sit at the top.
 
@@ -95,7 +101,9 @@ Dependencies flow one direction. `types.ts` and `errors.ts` have no dependencies
 
 **Three separate error channels.** HTTP status, the GraphQL `errors` array, and mutation `userErrors`. All three must be checked. A mutation rejected by a business rule returns HTTP 200 with no `errors` array — code checking only the first two reports success on a failed write.
 
-**Errors are checked before shape.** `requireData` inspects the `errors` array before validating structure, because a rejected request frequently returns `null` data *as a consequence* of the error. Validating first surfaces Zod's inference about the null instead of the API's explanation for it. This ordering bug cost four rounds of wrong guesses during development.
+**Errors are checked before shape.** `requireData` inspects the `errors` array before validating structure, because a rejected request frequently returns `null` data *as a consequence* of the error. Validating first surfaces Zod's inference about the null instead of the API's explanation for it.
+
+**Error description lives in one place.** `describeError` renders any thrown value with the detail its class carries; `handleFatal` wraps it with an exit code. Call sites that write their own summaries drop the useful part — this happened twice during development before the logic was extracted.
 
 **Retry decisions are status-based, not text-based.** 429 and 5xx retry; 4xx does not. Shopify's error pages contain reassuring prose like "this store will be right back" even for stores that never existed, so response body text is not used to decide retryability.
 
@@ -111,9 +119,11 @@ Dependencies flow one direction. `types.ts` and `errors.ts` have no dependencies
 
 **Retry is opt-in per operation, not global.** `shopifyGraphQL` accepts `retry: false`. `mutate` sets it from an explicit `idempotency` argument. Idempotency is a property of the operation, not something a wrapper can add — so the caller declares it rather than the transport guessing.
 
-**Reads paginate; writes batch.** Cursor pagination streams results without holding a catalog in memory. `metafieldsSet` accepts 25 metafields per call, so 17 products are one mutation rather than 17.
+**Reads paginate; writes batch.** Cursor pagination streams results without holding a catalog in memory. `metafieldsSet` accepts 25 metafields per call.
 
-**Nested connections truncate silently.** `inventoryLevels(first: 20)` inside a paginated variant query cannot itself be paginated by the outer generator. A variant stocked at more than 20 locations would be under-reported with no error. `inventory-report.ts` counts these cases explicitly rather than assuming they don't occur.
+**Bulk writes record per-item outcomes rather than throwing.** `createOne` returns a result object and never throws, so one failure at item 1,400 does not abandon the 599 still in flight. At scale, partial success is the normal case.
+
+**Test data generation uses a seeded PRNG.** A given `SEED` and `START_AT` always produce the same catalog, so a run can be reproduced exactly when two implementations disagree.
 
 ### Shopify data model
 
@@ -131,15 +141,36 @@ Findings verified against a live development store, not taken from documentation
 
 **Deactivated locations still hold stock.** `locations` omits inactive locations unless `includeInactive: true` is passed, so inventory at a closed warehouse silently disappears from a naive query.
 
-**Top-level `productVariants` avoids nesting cost.** 17 products expand to 26 variants. Querying variants nested inside products multiplies query cost and truncates at the inner connection limit; the flat connection does neither.
+**Top-level `productVariants` avoids nesting cost.** Querying variants nested inside products multiplies query cost and truncates at the inner connection limit; the flat connection does neither.
+
+**Shopify does not enforce SKU uniqueness.** Two products with identical variant SKUs coexist without complaint. Handles are auto-deduplicated (`carbon-boot-00001`, `carbon-boot-00001-1`); SKUs are not. Any downstream system keying on SKU must handle collisions rather than assuming uniqueness.
+
+**`userError` payload types differ per mutation.** `productCreate` and `productDelete` return plain `UserError` with only `field` and `message`. `productSet`, `productVariantsBulkCreate`, and `metafieldsSet` return richer types carrying `code`. Requesting `code` where it doesn't exist fails at query *validation*, before the mutation runs.
+
+**Two sequential mutations have no transaction.** `productCreate` followed by `productVariantsBulkCreate` leaves an orphaned product when the second call fails — the first is not rolled back. `productSet` with `synchronous: true` creates the product, its options, and its fully-specified variants atomically. Where an atomic single-call equivalent exists, use it; partial state cannot be retried away.
 
 **Metafield definitions require namespace ownership, not just a write scope.** Apps cannot create definitions in arbitrary namespaces. The `$app:` prefix reserves one — `$app:automation_lab` expands to `app--407236050945--automation_lab`. The access-denied message names both the namespace and the resource type as requirements without indicating which is missing.
 
-**App-namespaced metafields are invisible in the admin.** Merchant-defined fields in `custom` appear in the product editor and are editable; `$app:`-namespaced fields do not appear at all. This is correct for machine-written state like sync timestamps, and wrong for anything a merchant needs to manage. The namespace choice is a decision about data ownership, not naming.
+**App-namespaced metafields are invisible in the admin.** Merchant-defined fields in `custom` appear in the product editor and are editable; `$app:`-namespaced fields do not appear at all. Correct for machine-written state like sync timestamps, wrong for anything a merchant needs to manage. The namespace choice is a decision about data ownership, not naming.
 
-**`metafieldsSet` is an upsert.** Verified by writing an identical payload twice across 17 products: all 17 metafield IDs were unchanged and no duplicates were created. It matches on `ownerId` + `namespace` + `key`. `metafieldDefinitionCreate` is a create and offers no such guarantee — a replayed call fails with "namespace and key already in use," which is the correct loud failure.
+**`metafieldsSet` is an upsert.** Verified by writing an identical payload twice across 17 products: all 17 metafield IDs were unchanged and no duplicates created. It matches on `ownerId` + `namespace` + `key`. `metafieldDefinitionCreate` is a create and offers no such guarantee — a replayed call fails with "namespace and key already in use," which is the correct loud failure.
 
-**Granted scopes and declared scopes drift.** A version release changes what an app declares; the installation keeps the grant it was authorized under, and tokens are issued against the installation. Reads worked normally while every mutation was denied. `currentAppInstallation.accessScopes` is the ground truth.
+**Granted scopes and declared scopes drift.** A version release changes what an app declares; the installation keeps the grant it was authorized under. Reads worked normally while every mutation was denied. `currentAppInstallation.accessScopes` is the ground truth.
+
+## Measured behaviour
+
+Recorded against a Plus development store: 20,000-point bucket, 1000/sec restore.
+
+| Workload | Result |
+|---|---|
+| 2,000 products created (`productSet`, concurrency 4) | 8m 20s, 0 failures, bucket never dropped below 19,814 |
+| Full catalog read, `PAGE_SIZE=2` | 1,019 pages, 8m 51s, bucket steady at 19,996 |
+| Full catalog read, `PAGE_SIZE=250` | 9 pages, seconds |
+| Observed query cost | 10–20 points depending on depth |
+
+**The rate limiter has never triggered.** At concurrency 4 with ~17-point mutations at ~250ms each, spend was roughly 272 points/sec against a 1000/sec restore rate — refill outpaced consumption nearly 4×. Neither 2,000 concurrent mutations nor 1,019 sequential reads produced a single wait. `suggestedConcurrency()` returned its hardcoded ceiling of 20 for the entire run, never a bucket-derived figure.
+
+On a Basic-plan store (100 points, 50/sec) the same workload would throttle within the first two products.
 
 ## Exit codes
 
@@ -157,27 +188,31 @@ Following the `sysexits` convention so a scheduler can distinguish failure class
 
 ## Known limitations
 
-1. **Concurrency ceiling is arbitrary.** `suggestedConcurrency()` derives a rate from `restoreRate ÷ estimatedCost` but caps the result at 20. On a Plus store the uncapped figure is around 90, so the cap — not the bucket — is the binding constraint. The number was chosen for safety, not measured.
+1. **Concurrency ceiling is arbitrary.** `suggestedConcurrency()` derives a rate from `restoreRate ÷ estimatedCost` but caps at 20. The uncapped figure on this store is around 60. The cap, not the bucket, has been the binding constraint in every run to date.
 
-2. **Cost estimates are catalog-size dependent.** Observed cost ranged from 10 to 20 points depending on query depth, against a 17-product store. Actual cost scales with returned nodes, so the same queries against a 4,000-product catalog cost substantially more. The limiter adapts, but no figure recorded here is a constant.
+2. **Cost estimates are catalog-size dependent.** Observed cost ranged from 10 to 20 points depending on query depth. Actual cost scales with returned nodes, so no figure here is a constant.
 
-3. **Only tested against a Plus development store.** That store has a 20,000-point bucket restoring at 1000/sec. A Basic-plan store has 100 points at 50/sec. Benchmarks used under 3% of available capacity, so throttling has never been exercised against a real limit — only against a simulated one.
+3. **The rate limiter is untested under real pressure.** See *Measured behaviour* — no workload run so far has come close to draining the bucket. The waiting path has never executed against a genuine limit, only against a stubbed 429.
 
-4. **Single store per process.** `getConfig()` memoizes into module scope and `shopify.ts` exports one shared limiter instance, so this cannot talk to two shops in one run. `RateLimiter` is a class and would need no changes; the config layer would.
+4. **Single store per process.** `getConfig()` memoizes into module scope and `shopify.ts` exports one shared limiter instance. `RateLimiter` is a class and would need no changes; the config layer would.
 
-5. **No adaptive backoff on repeated throttling.** A sustained throttle is retried with the same computed wait each time. There is no escalation if the store is under pressure from another client.
+5. **No adaptive backoff on repeated throttling.** A sustained throttle is retried with the same computed wait each time, with no escalation.
 
 6. **Non-idempotent failures require manual reconciliation.** A create that fails after the write reached Shopify is not retried, by design — but nothing records the ambiguity for a human to resolve. A production system would log the attempt with a correlation ID before sending.
 
-7. **No scope preflight.** Scripts discover missing permissions when a mutation is denied mid-run. `check-scopes.ts` exists but must be run manually; a production system would assert required scopes at startup and refuse to begin.
+7. **No scope preflight.** Scripts discover missing permissions when a mutation is denied mid-run. `check-scopes.ts` exists but must be run manually.
 
 8. **Nested connection depth is fixed.** `inventoryLevels(first: 20)`, `variants(first: 10)`, and `metafields(first: 10)` are hardcoded. Stores exceeding those limits are under-reported; only the inventory case surfaces a count.
 
-9. **No bulk export.** Everything uses cursor pagination, which is correct at this scale and wrong at tens of thousands of records.
+9. **Teardown has a check-then-act race.** `collectIds()` and the delete loop are separate steps. Any product created between them is absent from the collected list and survives, while the script reports complete success. Observed by accidentally running generate and teardown concurrently — teardown reported `Deleted: 2, Failed: 0` and left a product behind.
 
-10. **No persistence.** Results are printed to stdout and discarded.
+10. **Generated products have no inventory.** `productSet` sets `tracked: true` but never creates inventory levels, so all 2,000 generated products show 0 in stock. Fine for read and pagination testing, useless for inventory logic testing.
 
-11. **No tests.** Failure paths were verified manually by breaking credentials, pointing `SHOP_DOMAIN` at an unresolvable host, stubbing a 429 response, placing an unfulfilled order to force committed stock, and running every script twice to exercise both branches.
+11. **No bulk export.** Everything uses cursor pagination, which is correct at this scale and wrong at tens of thousands of records.
+
+12. **No persistence.** Results are printed to stdout and discarded.
+
+13. **No tests.** Failure paths were verified manually: breaking credentials, pointing `SHOP_DOMAIN` at an unresolvable host, stubbing a 429, placing an unfulfilled order to force committed stock, and running every script twice to exercise both branches.
 
 ## Resolved
 
@@ -185,8 +220,9 @@ Following the `sysexits` convention so a scheduler can distinguish failure class
 - ~~Concurrency limit is hardcoded~~ — now derived from observed cost and restore rate.
 - ~~Throttle reporting understates pressure~~ — replaced by a limiter that extrapolates rather than trusting the last reading.
 - ~~`totalInventory` audit passed vacuously~~ — retested with committed stock present; the relationship holds and is documented.
-- ~~`retry.ts` is unsafe for mutations~~ — retry is now opt-in per operation, driven by an explicit idempotency classification.
+- ~~`retry.ts` is unsafe for mutations~~ — retry is now opt-in per operation, driven by explicit idempotency classification.
 - ~~Read-only~~ — write path implemented with `userErrors` handling and idempotency proven empirically.
+- ~~Catalog too small to test at scale~~ — 2,000 generated products with 6,014 variants.
 
 ## Roadmap
 
