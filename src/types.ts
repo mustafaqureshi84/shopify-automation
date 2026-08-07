@@ -59,6 +59,11 @@ export const PageInfoSchema = z.object({
 /**
  * Mutations report business-rule failures in `userErrors`, not in the
  * top-level `errors` array. HTTP is 200 and `errors` is absent.
+ *
+ * Note: `code` exists on some mutations' error types but not others.
+ * productCreate and productDelete return plain UserError (field + message
+ * only); productSet and productVariantsBulkCreate return richer types.
+ * Requesting `code` where it doesn't exist fails at query validation.
  */
 export const UserErrorSchema = z.object({
   field: z.array(z.string()).nullable(),
@@ -331,6 +336,72 @@ export const ProductsWithMetafieldsPageSchema = z.object({
       products: z.object({
         pageInfo: PageInfoSchema,
         nodes: z.array(ProductWithMetafieldsSchema),
+      }),
+    })
+    .optional(),
+  errors: z.unknown().optional(),
+});
+
+// ---------- generate-products.ts ----------
+
+/**
+ * productSet creates the product, its options, and its fully-specified
+ * variants in one atomic call. Doing this as productCreate followed by
+ * productVariantsBulkCreate leaves an orphaned product behind when the
+ * second call fails — there is no transaction across two mutations.
+ */
+export const ProductSetResponseSchema = z.object({
+  data: z
+    .object({
+      productSet: z.object({
+        product: z
+          .object({
+            id: z.string(),
+            handle: z.string(),
+            title: z.string(),
+            variants: z.object({
+              nodes: z.array(
+                z.object({ id: z.string(), sku: z.string().nullable() })
+              ),
+            }),
+          })
+          .nullable(),
+        userErrors: z.array(UserErrorSchema),
+      }),
+    })
+    .optional(),
+  errors: z.unknown().optional(),
+});
+
+// ---------- teardown-products.ts ----------
+
+export const ProductDeleteResponseSchema = z.object({
+  data: z
+    .object({
+      productDelete: z.object({
+        deletedProductId: z.string().nullable(),
+        userErrors: z.array(UserErrorSchema),
+      }),
+    })
+    .optional(),
+  errors: z.unknown().optional(),
+});
+
+export const GeneratedProductSchema = z.object({
+  id: z.string(),
+  handle: z.string(),
+  title: z.string(),
+  tags: z.array(z.string()),
+});
+
+export type GeneratedProduct = z.infer<typeof GeneratedProductSchema>;
+
+export const GeneratedProductsPageSchema = z.object({
+  data: z
+    .object({
+      products: z.object({
+        pageInfo: PageInfoSchema,
+        nodes: z.array(GeneratedProductSchema),
       }),
     })
     .optional(),

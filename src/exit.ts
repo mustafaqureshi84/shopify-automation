@@ -1,40 +1,59 @@
 import { ConfigError, ShopifyApiError, ShopifyAuthError } from './errors.js';
 import { RetryExhaustedError } from './retry.js';
+import { UserErrorsFailure } from './mutations.js';
 
-export function handleFatal(err: unknown): never {
+/**
+ * Renders any thrown value as readable text, preserving the detail each
+ * error class carries. Written once so call sites don't each invent their
+ * own summary and silently drop the useful part.
+ */
+export function describeError(err: unknown): string {
+  if (err instanceof UserErrorsFailure) {
+    return `[userErrors] ${err.message}\n${JSON.stringify(err.userErrors, null, 2)}`;
+  }
+
   if (err instanceof ConfigError) {
-    console.error(`[config] ${err.message}`);
-    process.exit(78);
+    return `[config] ${err.message}`;
   }
 
   if (err instanceof RetryExhaustedError) {
-    console.error(`[retry] ${err.message}`);
-    if (err.lastError instanceof Error) {
-      console.error(`  last error: ${err.lastError.message}`);
-    }
-    process.exit(75);
+    const last =
+      err.lastError instanceof Error
+        ? `\n  last error: ${err.lastError.message}`
+        : '';
+    return `[retry] ${err.message}${last}`;
   }
 
   if (err instanceof ShopifyAuthError) {
-    console.error(`[auth] ${err.message}`);
-    if (err.body) console.error(err.body);
-    process.exit(err.isRetryable ? 75 : 77);
+    const body = err.body ? `\n${err.body}` : '';
+    return `[auth] ${err.message}${body}`;
   }
 
   if (err instanceof ShopifyApiError) {
-    console.error(`[api] ${err.message}`);
-    if (err.detail !== undefined) {
-      console.error(JSON.stringify(err.detail, null, 2));
-    }
-    process.exit(70);
+    const detail =
+      err.detail !== undefined
+        ? `\n${JSON.stringify(err.detail, null, 2)}`
+        : '';
+    return `[api] ${err.message}${detail}`;
   }
 
   if (err instanceof Error) {
-    console.error(`[unexpected] ${err.name}: ${err.message}`);
-    console.error(err.stack);
-    process.exit(1);
+    return `[unexpected] ${err.name}: ${err.message}\n${err.stack ?? ''}`;
   }
 
-  console.error('[unknown] Non-Error value thrown:', err);
-  process.exit(1);
+  return `[unknown] Non-Error value thrown: ${String(err)}`;
+}
+
+function exitCodeFor(err: unknown): number {
+  if (err instanceof UserErrorsFailure) return 65;
+  if (err instanceof ConfigError) return 78;
+  if (err instanceof RetryExhaustedError) return 75;
+  if (err instanceof ShopifyAuthError) return err.isRetryable ? 75 : 77;
+  if (err instanceof ShopifyApiError) return 70;
+  return 1;
+}
+
+export function handleFatal(err: unknown): never {
+  console.error(describeError(err));
+  process.exit(exitCodeFor(err));
 }
