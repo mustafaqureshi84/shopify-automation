@@ -57,13 +57,9 @@ export const PageInfoSchema = z.object({
 // ---------- Mutations ----------
 
 /**
- * Mutations report business-rule failures in `userErrors`, not in the
- * top-level `errors` array. HTTP is 200 and `errors` is absent.
- *
- * Note: `code` exists on some mutations' error types but not others.
+ * `code` exists on some mutations' error types but not others.
  * productCreate and productDelete return plain UserError (field + message
- * only); productSet and productVariantsBulkCreate return richer types.
- * Requesting `code` where it doesn't exist fails at query validation.
+ * only). Requesting `code` where it doesn't exist fails at query validation.
  */
 export const UserErrorSchema = z.object({
   field: z.array(z.string()).nullable(),
@@ -346,9 +342,8 @@ export const ProductsWithMetafieldsPageSchema = z.object({
 
 /**
  * productSet creates the product, its options, and its fully-specified
- * variants in one atomic call. Doing this as productCreate followed by
- * productVariantsBulkCreate leaves an orphaned product behind when the
- * second call fails — there is no transaction across two mutations.
+ * variants in one atomic call. productCreate followed by
+ * productVariantsBulkCreate leaves an orphan when the second call fails.
  */
 export const ProductSetResponseSchema = z.object({
   data: z
@@ -407,3 +402,68 @@ export const GeneratedProductsPageSchema = z.object({
     .optional(),
   errors: z.unknown().optional(),
 });
+
+// ---------- bulk-export.ts ----------
+
+export const BulkOperationSchema = z.object({
+  id: z.string(),
+  status: z.enum([
+    'CREATED',
+    'RUNNING',
+    'COMPLETED',
+    'CANCELING',
+    'CANCELED',
+    'FAILED',
+    'EXPIRED',
+  ]),
+  errorCode: z.string().nullable(),
+  createdAt: z.string(),
+  completedAt: z.string().nullable(),
+  objectCount: z.string(),
+  fileSize: z.string().nullable(),
+  url: z.string().nullable(),
+  partialDataUrl: z.string().nullable(),
+});
+
+export type BulkOperation = z.infer<typeof BulkOperationSchema>;
+
+export const BulkRunQueryResponseSchema = z.object({
+  data: z
+    .object({
+      bulkOperationRunQuery: z.object({
+        bulkOperation: BulkOperationSchema.nullable(),
+        userErrors: z.array(UserErrorSchema),
+      }),
+    })
+    .optional(),
+  errors: z.unknown().optional(),
+});
+
+export const CurrentBulkOperationResponseSchema = z.object({
+  data: z
+    .object({
+      currentBulkOperation: BulkOperationSchema.nullable(),
+    })
+    .optional(),
+  errors: z.unknown().optional(),
+});
+
+export const BulkCancelResponseSchema = z.object({
+  data: z
+    .object({
+      bulkOperationCancel: z.object({
+        bulkOperation: BulkOperationSchema.nullable(),
+        userErrors: z.array(UserErrorSchema),
+      }),
+    })
+    .optional(),
+  errors: z.unknown().optional(),
+});
+
+/** A JSONL line: any object, always with `id`, sometimes with `__parentId`. */
+export const BulkLineSchema = z.looseObject({
+  id: z.string(),
+  __parentId: z.string().optional(),
+});
+
+export type BulkLine = z.infer<typeof BulkLineSchema>;
