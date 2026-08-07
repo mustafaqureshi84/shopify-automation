@@ -52,6 +52,7 @@ SHOPIFY_CLIENT_SECRET=
 npx tsx src/first-query.ts       # minimal single query — 10 products
 npx tsx src/export-products.ts   # full catalog via cursor pagination
 npx tsx src/async-patterns.ts    # concurrency benchmark, 4 strategies
+npx tsx src/inventory-report.ts  # per-location stock, quantity-name audit
 ```
 
 `export-products.ts` accepts `PAGE_SIZE` to control page size:
@@ -75,10 +76,13 @@ PAGE_SIZE=250 npx tsx src/export-products.ts
 | `src/first-query.ts` | Script: minimal query example |
 | `src/export-products.ts` | Script: paginated catalog export |
 | `src/async-patterns.ts` | Script: concurrency benchmark |
+| `src/inventory-report.ts` | Script: location and inventory-level traversal |
 
 Dependencies flow one direction. `types.ts` and `errors.ts` have no dependencies; scripts sit at the top.
 
 ## Design notes
+
+### Engineering
 
 **Validation at the boundary.** Every response is parsed with `safeParse` before use. There are no `as` type assertions — types are a consequence of validation rather than a promise to the compiler.
 
@@ -95,6 +99,26 @@ Dependencies flow one direction. `types.ts` and `errors.ts` have no dependencies
 **Rate limiting is adaptive, not configured.** The limiter reads `throttleStatus` from every response, extrapolates refill from elapsed time, and reserves points before admitting a request. Concurrency is derived as `restoreRate ÷ estimatedCost` rather than hardcoded. A 20% reserve is held back so this client doesn't starve other processes sharing the same store's bucket.
 
 **Cost estimation biases toward the peak.** The estimate is the midpoint of the mean and maximum observed cost, because underestimating causes throttles while overestimating only costs a little throughput.
+
+**Nested connections truncate silently.** `inventoryLevels(first: 20)` inside a paginated variant query cannot itself be paginated by the outer generator. A variant stocked at more than 20 locations would be under-reported with no error. `inventory-report.ts` counts these cases explicitly rather than assuming they don't occur.
+
+### Shopify data model
+
+Findings verified against a live development store, not taken from documentation.
+
+**Inventory does not live on a variant.** The chain is `ProductVariant → InventoryItem → InventoryLevel → Location`. A variant has one level per location. `variant.inventoryQuantity` is a convenience sum and returns `null` when tracking is disabled.
+
+**Untracked variants are not zero-stock variants.** A variant with `inventoryItem.tracked === false` has no levels at all. Treating it as `0` in a sync would overwrite a downstream system with a number meaning "none" when the truth is "unknown."
+
+**Quantity names are not interchangeable.** Verified by placing an unfulfilled test order: one unit moved from `available` while `on_hand` stayed constant and `committed` rose to 1. The same physical unit is simultaneously on the shelf, unsellable, and owed to a customer. Syncing `on_hand` to a sales channel oversells; syncing `available` to a warehouse system reports a phantom discrepancy at every stock count.
+
+**`totalInventory` reflects `available`, not `on_hand`.** Confirmed under the committed-stock condition above — the product total tracked the drop in `available` and the audit still reconciled. It is a safe sum-of-available shortcut and an unsafe measure of physical stock, despite the name.
+
+**Location capability constrains usable inventory.** The test store holds 50 units at a location flagged `shipsInventory: false`. Summing `available` across all locations overstates fulfillable stock by that amount. Any "can we ship this" calculation must filter on `shipsInventory` and `fulfillsOnlineOrders` before summing.
+
+**Deactivated locations still hold stock.** `locations` omits inactive locations unless `includeInactive: true` is passed, so inventory at a closed warehouse silently disappears from a naive query.
+
+**Top-level `productVariants` avoids nesting cost.** 17 products expand to 26 variants. Querying variants nested inside products multiplies query cost and truncates at the inner connection limit; the flat connection does neither.
 
 ## Exit codes
 
@@ -113,30 +137,35 @@ Following the `sysexits` convention so a scheduler can distinguish failure class
 
 1. **Concurrency ceiling is arbitrary.** `suggestedConcurrency()` derives a rate from `restoreRate ÷ estimatedCost` but caps the result at 20. On a Plus store the uncapped figure is around 90, so the cap — not the bucket — is the binding constraint. The number was chosen for safety, not measured.
 
-2. **Cost estimates are catalog-size dependent.** The observed cost of ~11 points reflects a 17-product store. Actual query cost scales with returned nodes, so the same query against a 4,000-product catalog costs substantially more. The limiter adapts, but any figure recorded here is not a constant.
+2. **Cost estimates are catalog-size dependent.** Observed cost ranged from 11 to 20 points depending on query depth, against a 17-product store. Actual cost scales with returned nodes, so the same queries against a 4,000-product catalog cost substantially more. The limiter adapts, but no figure recorded here is a constant.
 
-3. **Only tested against a Plus development store.** That store has a 20,000-point bucket restoring at 1000/sec. A Basic-plan store has 100 points at 50/sec. Benchmarks used under 3% of available capacity, so throttling behaviour has never actually been exercised against a real limit — only against a simulated one.
+3. **Only tested against a Plus development store.** That store has a 20,000-point bucket restoring at 1000/sec. A Basic-plan store has 100 points at 50/sec. Benchmarks used under 3% of available capacity, so throttling has never been exercised against a real limit — only against a simulated one.
 
 4. **Single store per process.** `getConfig()` memoizes into module scope and `shopify.ts` exports one shared limiter instance, so this cannot talk to two shops in one run. `RateLimiter` is a class and would need no changes; the config layer would.
 
 5. **No adaptive backoff on repeated throttling.** A sustained throttle is retried with the same computed wait each time. There is no escalation if the store is under pressure from another client.
 
-6. **Read-only.** No mutations are performed. Nothing here has been tested against write scopes, and idempotency has not been considered.
+6. **`retry.ts` is unsafe for mutations.** `withRetry` wraps every request indiscriminately. All current operations are reads, which are naturally idempotent, so this has not caused a problem. A retried write without an idempotency key could duplicate data.
 
-7. **No persistence.** Results are printed to stdout and discarded.
+7. **Read-only.** No mutations are performed and no write scopes are requested.
 
-8. **No tests.** Failure paths were verified manually by breaking credentials, pointing `SHOP_DOMAIN` at an unresolvable host, and stubbing a 429 response.
+8. **Nested connection depth is fixed.** `inventoryLevels(first: 20)` and `variants(first: 10)` are hardcoded. Stores exceeding those limits are under-reported; the count is surfaced but not handled.
+
+9. **No persistence.** Results are printed to stdout and discarded.
+
+10. **No tests.** Failure paths were verified manually by breaking credentials, pointing `SHOP_DOMAIN` at an unresolvable host, stubbing a 429 response, and placing an unfulfilled order to force committed stock.
 
 ## Resolved
 
 - ~~No token invalidation on 401~~ — a rejected token now clears the cache and retries.
 - ~~Concurrency limit is hardcoded~~ — now derived from observed cost and restore rate.
 - ~~Throttle reporting understates pressure~~ — replaced by a limiter that extrapolates rather than trusting the last reading.
+- ~~`totalInventory` audit passed vacuously~~ — retested with committed stock present; the relationship holds and is now documented.
 
 ## Roadmap
 
-- Shopify object graph: inventory, fulfillment orders, locations
-- Metafields and metaobjects
+- Metafields and metaobjects; first mutations and idempotency
+- Fulfillment orders and location routing
 - Bulk Operations for large catalogs
 - Postgres persistence via Prisma
 - Webhook receiver with HMAC verification and idempotent handlers

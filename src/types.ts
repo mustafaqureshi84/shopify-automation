@@ -169,3 +169,75 @@ export const ProductsPageSchema = z.object({
     .optional(),
   errors: z.unknown().optional(),
 });
+
+// ---------- inventory-report.ts ----------
+
+export const LocationSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  isActive: z.boolean(),
+  shipsInventory: z.boolean(),
+  fulfillsOnlineOrders: z.boolean(),
+});
+
+export type Location = z.infer<typeof LocationSchema>;
+
+export const LocationsPageSchema = z.object({
+  data: z
+    .object({
+      locations: z.object({
+        pageInfo: PageInfoSchema,
+        nodes: z.array(LocationSchema),
+      }),
+    })
+    .optional(),
+  errors: z.unknown().optional(),
+});
+
+export const InventoryQuantitySchema = z.object({
+  name: z.string(),
+  quantity: z.number(),
+});
+
+export const InventoryLevelSchema = z.object({
+  id: z.string(),
+  location: z.object({ id: z.string(), name: z.string() }),
+  quantities: z.array(InventoryQuantitySchema),
+});
+
+export const InventoryItemSchema = z.object({
+  id: z.string(),
+  tracked: z.boolean(),
+  inventoryLevels: z.object({
+    pageInfo: PageInfoSchema,
+    nodes: z.array(InventoryLevelSchema),
+  }),
+});
+
+export const VariantWithInventorySchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  sku: z.string().nullable(),
+  inventoryQuantity: z.number().nullable(),
+  inventoryItem: InventoryItemSchema.nullable(),
+  product: z.object({
+    id: z.string(),
+    title: z.string(),
+    status: z.enum(['ACTIVE', 'ARCHIVED', 'DRAFT']),
+    totalInventory: z.number().nullable(),
+  }),
+});
+
+export type VariantWithInventory = z.infer<typeof VariantWithInventorySchema>;
+
+export const VariantsPageSchema = z.object({
+  data: z
+    .object({
+      productVariants: z.object({
+        pageInfo: PageInfoSchema,
+        nodes: z.array(VariantWithInventorySchema),
+      }),
+    })
+    .optional(),
+  errors: z.unknown().optional(),
+});
