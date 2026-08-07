@@ -1,11 +1,15 @@
 import { z } from 'zod';
 
+// ---------- Auth ----------
+
 export const TokenResponseSchema = z.object({
   access_token: z.string(),
   expires_in: z.number().optional(),
 });
 
 export type TokenResponse = z.infer<typeof TokenResponseSchema>;
+
+// ---------- Rate limiting ----------
 
 export const ThrottleStatusSchema = z.object({
   maximumAvailable: z.number(),
@@ -24,6 +28,15 @@ export const ThrottleEnvelopeSchema = z.object({
     }),
   }),
 });
+
+// ---------- Pagination ----------
+
+export const PageInfoSchema = z.object({
+  hasNextPage: z.boolean(),
+  endCursor: z.string().nullable(),
+});
+
+// ---------- first-query.ts ----------
 
 export const ProductNodeSchema = z.object({
   id: z.string(),
@@ -54,6 +67,8 @@ export const ProductsResponseSchema = z.object({
 });
 
 export type ProductsResponse = z.infer<typeof ProductsResponseSchema>;
+
+// ---------- async-patterns.ts ----------
 
 export const ProductIdListSchema = z.object({
   data: z
@@ -106,6 +121,31 @@ export const ProductInventorySchema = z.object({
           }),
         })
         .nullable(),
+    })
+    .optional(),
+  errors: z.unknown().optional(),
+});
+
+// ---------- export-products.ts ----------
+
+export const ProductListItemSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  handle: z.string(),
+  status: z.enum(['ACTIVE', 'ARCHIVED', 'DRAFT']),
+  totalInventory: z.number().nullable(),
+  variantsCount: z.object({ count: z.number() }).nullable().optional(),
+});
+
+export type ProductListItem = z.infer<typeof ProductListItemSchema>;
+
+export const ProductsPageSchema = z.object({
+  data: z
+    .object({
+      products: z.object({
+        pageInfo: PageInfoSchema,
+        nodes: z.array(ProductListItemSchema),
+      }),
     })
     .optional(),
   errors: z.unknown().optional(),
