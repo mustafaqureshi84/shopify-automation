@@ -1,10 +1,21 @@
 import { getConfig } from './config.js';
 import { ShopifyAuthError, ShopifyApiError } from './errors.js';
 import { withRetry, RetryableHttpError } from './retry.js';
-import { TokenResponseSchema, ThrottleEnvelopeSchema } from './types.js';
-import type { ThrottleStatus } from './types.js';
+import { RateLimiter } from './rate-limiter.js';
+import {
+  TokenResponseSchema,
+  ThrottleEnvelopeSchema,
+  GraphQLErrorEnvelopeSchema,
+} from './types.js';
+import type { Cost, ThrottleStatus } from './types.js';
 
 let cachedToken: { value: string; expiresAt: number } | null = null;
+
+export const limiter = new RateLimiter({ label: 'admin' });
+
+export function invalidateToken(): void {
+  cachedToken = null;
+}
 
 export async function summarizeErrorBody(res: Response): Promise<string> {
   const contentType = res.headers.get('content-type') ?? '';
@@ -64,8 +75,6 @@ export async function getAccessToken(): Promise<string> {
       });
 
       if (!res.ok) {
-        const detail = await summarizeErrorBody(res);
-
         if (isTransientStatus(res.status)) {
           throw new RetryableHttpError(
             `Token request failed with status ${res.status}`,
@@ -77,7 +86,7 @@ export async function getAccessToken(): Promise<string> {
         throw new ShopifyAuthError(
           `Token request failed with status ${res.status}`,
           res.status,
-          detail
+          await summarizeErrorBody(res)
         );
       }
 
@@ -106,6 +115,24 @@ export async function getAccessToken(): Promise<string> {
   return cachedToken.value;
 }
 
+function readCost(body: unknown): Cost | null {
+  const envelope = ThrottleEnvelopeSchema.safeParse(body);
+  return envelope.success ? envelope.data.extensions.cost : null;
+}
+
+/** THROTTLED arrives as HTTP 200 with an errors array — not a 429. */
+function findThrottleError(body: unknown): string | null {
+  const parsed = GraphQLErrorEnvelopeSchema.safeParse(body);
+  if (!parsed.success || !parsed.data.errors) return null;
+
+  for (const err of parsed.data.errors) {
+    if (err.extensions?.code === 'THROTTLED') return err.message;
+    if (err.message.toUpperCase().includes('THROTTLED')) return err.message;
+  }
+
+  return null;
+}
+
 export interface GraphQLResult {
   body: unknown;
   cost: ThrottleStatus | null;
@@ -116,47 +143,79 @@ export async function shopifyGraphQL(
   variables?: Record<string, unknown>
 ): Promise<GraphQLResult> {
   const { shop, apiVersion } = getConfig();
-  const token = await getAccessToken();
 
   return withRetry(
     async () => {
-      const res = await fetch(
-        `https://${shop}/admin/api/${apiVersion}/graphql.json`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Shopify-Access-Token': token,
-          },
-          body: JSON.stringify(variables ? { query, variables } : { query }),
-        }
-      );
+      const token = await getAccessToken();
 
-      if (!res.ok) {
-        if (isTransientStatus(res.status)) {
+      await limiter.acquire();
+
+      let body: unknown;
+      let res: Response;
+
+      try {
+        res = await fetch(
+          `https://${shop}/admin/api/${apiVersion}/graphql.json`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Shopify-Access-Token': token,
+            },
+            body: JSON.stringify(variables ? { query, variables } : { query }),
+          }
+        );
+
+        if (res.status === 401) {
+          invalidateToken();
           throw new RetryableHttpError(
-            `Admin API request failed with status ${res.status}`,
-            res.status,
-            parseRetryAfter(res)
+            'Access token was rejected — refreshing',
+            401,
+            null
           );
         }
 
-        throw new ShopifyApiError(
-          `Admin API request failed with status ${res.status}`,
-          await summarizeErrorBody(res)
+        if (!res.ok) {
+          if (isTransientStatus(res.status)) {
+            throw new RetryableHttpError(
+              `Admin API request failed with status ${res.status}`,
+              res.status,
+              parseRetryAfter(res)
+            );
+          }
+
+          throw new ShopifyApiError(
+            `Admin API request failed with status ${res.status}`,
+            await summarizeErrorBody(res)
+          );
+        }
+
+        body = await res.json();
+      } finally {
+        limiter.release();
+      }
+
+      const cost = readCost(body);
+      const throttleMessage = findThrottleError(body);
+
+      if (throttleMessage) {
+        limiter.markThrottled(cost?.throttleStatus);
+
+        const waitMs = limiter.waitTimeFor(cost?.requestedQueryCost ?? 100);
+
+        throw new RetryableHttpError(
+          `Throttled by Shopify: ${throttleMessage}`,
+          429,
+          Math.max(waitMs, 1000)
         );
       }
 
-      const body: unknown = await res.json();
-      const envelope = ThrottleEnvelopeSchema.safeParse(body);
+      if (cost) {
+        limiter.record(cost.throttleStatus, cost.actualQueryCost ?? undefined);
+      }
 
-      return {
-        body,
-        cost: envelope.success
-          ? envelope.data.extensions.cost.throttleStatus
-          : null,
-      };
+      return { body, cost: cost?.throttleStatus ?? null };
     },
-    { label: 'admin graphql' }
+    { label: 'admin graphql', maxAttempts: 5 }
   );
 }

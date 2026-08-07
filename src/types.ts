@@ -19,14 +19,33 @@ export const ThrottleStatusSchema = z.object({
 
 export type ThrottleStatus = z.infer<typeof ThrottleStatusSchema>;
 
+export const CostSchema = z.object({
+  requestedQueryCost: z.number(),
+  actualQueryCost: z.number().nullable().optional(),
+  throttleStatus: ThrottleStatusSchema,
+});
+
+export type Cost = z.infer<typeof CostSchema>;
+
 export const ThrottleEnvelopeSchema = z.object({
-  extensions: z.object({
-    cost: z.object({
-      requestedQueryCost: z.number(),
-      actualQueryCost: z.number().optional(),
-      throttleStatus: ThrottleStatusSchema,
-    }),
-  }),
+  extensions: z.object({ cost: CostSchema }),
+});
+
+/** GraphQL errors arrive with HTTP 200, so they need their own schema. */
+export const GraphQLErrorSchema = z.object({
+  message: z.string(),
+  extensions: z
+    .object({
+      code: z.string().optional(),
+      documentation: z.string().optional(),
+    })
+    .nullable()
+    .optional(),
+});
+
+export const GraphQLErrorEnvelopeSchema = z.object({
+  errors: z.array(GraphQLErrorSchema).optional(),
+  extensions: z.object({ cost: CostSchema }).optional(),
 });
 
 // ---------- Pagination ----------

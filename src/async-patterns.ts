@@ -1,12 +1,11 @@
-import { shopifyGraphQL } from './shopify.js';
+import { shopifyGraphQL, limiter } from './shopify.js';
 import { ProductIdListSchema, ProductInventorySchema } from './types.js';
 import { ShopifyApiError } from './errors.js';
 import { handleFatal } from './exit.js';
-import type { ThrottleStatus } from './types.js';
 
 const PRODUCT_IDS_QUERY = `
   query ProductIds {
-    products(first: 10) {
+    products(first: 20) {
       edges { node { id title } }
     }
   }
@@ -43,8 +42,6 @@ interface InventorySummary {
   totalAvailable: number;
 }
 
-let lastThrottle: ThrottleStatus | null = null;
-
 async function fetchProductIds(): Promise<string[]> {
   const { body } = await shopifyGraphQL(PRODUCT_IDS_QUERY);
   const parsed = ProductIdListSchema.safeParse(body);
@@ -57,9 +54,7 @@ async function fetchProductIds(): Promise<string[]> {
 }
 
 async function fetchInventory(id: string): Promise<InventorySummary> {
-  const { body, cost } = await shopifyGraphQL(INVENTORY_QUERY, { id });
-  if (cost) lastThrottle = cost;
-
+  const { body } = await shopifyGraphQL(INVENTORY_QUERY, { id });
   const parsed = ProductInventorySchema.safeParse(body);
 
   if (!parsed.success) {
@@ -128,16 +123,15 @@ export async function mapWithConcurrency<T, R>(
   return results;
 }
 
-function report(label: string, results: InventorySummary[]): void {
+function report(results: InventorySummary[]): void {
   const total = results.reduce((sum, r) => sum + r.totalAvailable, 0);
-  console.log(`  ${results.length} products, ${total} units available`);
+  const s = limiter.snapshot();
 
-  if (lastThrottle) {
-    console.log(
-      `  throttle after ${label}: ` +
-        `${lastThrottle.currentlyAvailable}/${lastThrottle.maximumAvailable}`
-    );
-  }
+  console.log(`  ${results.length} products, ${total} units available`);
+  console.log(
+    `  bucket ${s.available}/${s.maximum}, ` +
+      `est cost ${s.estimatedCost}, restore ${s.restoreRate}/s`
+  );
 }
 
 function sleep(ms: number): Promise<void> {
@@ -150,27 +144,32 @@ async function main(): Promise<void> {
 
   console.log('1. Sequential');
   console.time('  sequential');
-  const seq = await runSequential(ids);
+  report(await runSequential(ids));
   console.timeEnd('  sequential');
-  report('sequential', seq);
 
-  console.log('\n  waiting 5s for the bucket to refill...\n');
-  await sleep(5000);
+  await sleep(3000);
 
-  console.log('2. Parallel (Promise.all, unbounded)');
+  console.log('\n2. Parallel (Promise.all, unbounded)');
   console.time('  parallel');
-  const par = await runParallel(ids);
+  report(await runParallel(ids));
   console.timeEnd('  parallel');
-  report('parallel', par);
 
-  console.log('\n  waiting 5s for the bucket to refill...\n');
-  await sleep(5000);
+  await sleep(3000);
 
-  console.log('3. Bounded concurrency (limit 3)');
-  console.time('  bounded');
-  const bounded = await mapWithConcurrency(ids, 3, fetchInventory);
-  console.timeEnd('  bounded');
-  report('bounded', bounded);
+  console.log('\n3. Bounded (hardcoded limit 3)');
+  console.time('  bounded-3');
+  report(await mapWithConcurrency(ids, 3, fetchInventory));
+  console.timeEnd('  bounded-3');
+
+  await sleep(3000);
+
+  const suggested = limiter.suggestedConcurrency();
+  console.log(`\n4. Bounded (limiter-derived limit ${suggested})`);
+  console.time('  bounded-adaptive');
+  report(await mapWithConcurrency(ids, suggested, fetchInventory));
+  console.timeEnd('  bounded-adaptive');
+
+  console.log('\nFinal limiter state:', limiter.snapshot());
 }
 
 main().catch(handleFatal);
