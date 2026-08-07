@@ -54,6 +54,7 @@ SHOPIFY_CLIENT_SECRET=
 npx tsx src/check-scopes.ts        # what scopes does this token actually have
 npx tsx src/first-query.ts         # minimal single query — 10 products
 npx tsx src/export-products.ts     # full catalog via cursor pagination
+npx tsx src/bulk-export.ts         # full catalog via Bulk Operations + JSONL
 npx tsx src/async-patterns.ts      # concurrency benchmark, 4 strategies
 npx tsx src/inventory-report.ts    # per-location stock, quantity-name audit
 npx tsx src/metafields.ts          # definition lifecycle, mutations, idempotency proof
@@ -81,10 +82,12 @@ CONFIRM=yes                        # teardown-products.ts safety gate
 | `src/shopify.ts` | Transport layer — the only file that calls `fetch` |
 | `src/mutations.ts` | Write path: `userErrors` handling, idempotency classification, `requireData` |
 | `src/paginate.ts` | Generic cursor-pagination async generators |
+| `src/bulk.ts` | Bulk Operations lifecycle: submit, poll with backoff, stream JSONL, group by parent |
 | `src/types.ts` | Zod schemas; TypeScript types derived via `z.infer` |
 | `src/check-scopes.ts` | Script: diagnostic for granted vs declared scopes |
 | `src/first-query.ts` | Script: minimal query example |
 | `src/export-products.ts` | Script: paginated catalog export |
+| `src/bulk-export.ts` | Script: bulk catalog export, cross-checked against pagination |
 | `src/async-patterns.ts` | Script: concurrency benchmark |
 | `src/inventory-report.ts` | Script: location and inventory-level traversal |
 | `src/metafields.ts` | Script: metafield definitions and idempotent writes |
@@ -123,6 +126,14 @@ Dependencies flow one direction. `types.ts` and `errors.ts` have no dependencies
 
 **Bulk writes record per-item outcomes rather than throwing.** `createOne` returns a result object and never throws, so one failure at item 1,400 does not abandon the 599 still in flight. At scale, partial success is the normal case.
 
+**JSONL parsing must handle chunk boundaries.** Network chunks do not align with newlines, so a chunk can end mid-object. `streamLines` buffers the partial line until the remainder arrives. Splitting each chunk on `\n` independently produces corrupt JSON on any file large enough to span chunks — the most common bug in JSONL parsers.
+
+**Bulk results are grouped by streaming, not buffering.** Shopify guarantees child lines immediately follow their parent, so a group is complete once the next parent appears. Building a Map of all parents first works at 2,000 products and exhausts memory at 500,000.
+
+**Poll intervals back off.** Every status check is a real API request. Polling a five-minute export every second spends 300 requests learning nothing. The interval grows 1.5× to a 10-second ceiling.
+
+**Bulk operations are singular per app per store.** A run that crashes mid-poll leaves an operation in flight and blocks the next submission. `getCurrentOperation()` is checked before submitting — and is also the mechanism for resuming after a crash rather than restarting.
+
 **Test data generation uses a seeded PRNG.** A given `SEED` and `START_AT` always produce the same catalog, so a run can be reproduced exactly when two implementations disagree.
 
 ### Shopify data model
@@ -149,6 +160,10 @@ Findings verified against a live development store, not taken from documentation
 
 **Two sequential mutations have no transaction.** `productCreate` followed by `productVariantsBulkCreate` leaves an orphaned product when the second call fails — the first is not rolled back. `productSet` with `synchronous: true` creates the product, its options, and its fully-specified variants atomically. Where an atomic single-call equivalent exists, use it; partial state cannot be retried away.
 
+**Bulk queries use a different dialect.** `edges { node { } }` is required; the `nodes` shorthand is unsupported. Nested connections take no `first:` argument and return every node, so the truncation that constrains normal queries does not exist in bulk.
+
+**`objectCount` counts JSONL lines, not records.** An export of 2,037 products with 6,096 variants reports 8,133 objects.
+
 **Metafield definitions require namespace ownership, not just a write scope.** Apps cannot create definitions in arbitrary namespaces. The `$app:` prefix reserves one — `$app:automation_lab` expands to `app--407236050945--automation_lab`. The access-denied message names both the namespace and the resource type as requirements without indicating which is missing.
 
 **App-namespaced metafields are invisible in the admin.** Merchant-defined fields in `custom` appear in the product editor and are editable; `$app:`-namespaced fields do not appear at all. Correct for machine-written state like sync timestamps, wrong for anything a merchant needs to manage. The namespace choice is a decision about data ownership, not naming.
@@ -159,16 +174,21 @@ Findings verified against a live development store, not taken from documentation
 
 ## Measured behaviour
 
-Recorded against a Plus development store: 20,000-point bucket, 1000/sec restore.
+Recorded against a Plus development store: 20,000-point bucket, 1000/sec restore. Catalog of 2,037 products / 6,096 variants.
 
 | Workload | Result |
 |---|---|
-| 2,000 products created (`productSet`, concurrency 4) | 8m 20s, 0 failures, bucket never dropped below 19,814 |
-| Full catalog read, `PAGE_SIZE=2` | 1,019 pages, 8m 51s, bucket steady at 19,996 |
-| Full catalog read, `PAGE_SIZE=250` | 9 pages, seconds |
-| Observed query cost | 10–20 points depending on depth |
+| 2,000 products created (`productSet`, concurrency 4) | 8m 20s, 0 failures, bucket never below 19,814 |
+| Full read, `PAGE_SIZE=2` | 1,019 pages, 8m 51s |
+| Full read, `PAGE_SIZE=250` | 9 pages, 6.2s, bucket 19,976 |
+| Full read, Bulk Operations | 6.2s to complete + 2.2s to parse, bucket 20,000 |
+| Observed query cost | 7–20 points depending on depth |
 
-**The rate limiter has never triggered.** At concurrency 4 with ~17-point mutations at ~250ms each, spend was roughly 272 points/sec against a 1000/sec restore rate — refill outpaced consumption nearly 4×. Neither 2,000 concurrent mutations nor 1,019 sequential reads produced a single wait. `suggestedConcurrency()` returned its hardcoded ceiling of 20 for the entire run, never a bucket-derived figure.
+**Bulk and paginated exports agree exactly** — 2,037 products, 1,866 ACTIVE / 1 ARCHIVED / 170 DRAFT, 679 tracked inventory. Two independent implementations producing identical results is stronger evidence than either running without error.
+
+**At this scale bulk offers no speed advantage.** Both complete in about six seconds. Its benefit is the shape of the curve, not the constant: pagination is linear in round trips (20,000 products = 80 requests) while bulk is one submission regardless. It also consumes almost no rate limit — the bucket finished at full capacity, versus nine requests' worth spent by pagination.
+
+**The rate limiter has still never triggered.** At concurrency 4 with ~17-point mutations at ~250ms each, spend was roughly 272 points/sec against a 1000/sec restore rate — refill outpaced consumption nearly 4×. Neither 2,000 concurrent mutations nor 1,019 sequential reads produced a single wait. `suggestedConcurrency()` returned its hardcoded ceiling of 20 throughout, never a bucket-derived figure.
 
 On a Basic-plan store (100 points, 50/sec) the same workload would throttle within the first two products.
 
@@ -190,9 +210,9 @@ Following the `sysexits` convention so a scheduler can distinguish failure class
 
 1. **Concurrency ceiling is arbitrary.** `suggestedConcurrency()` derives a rate from `restoreRate ÷ estimatedCost` but caps at 20. The uncapped figure on this store is around 60. The cap, not the bucket, has been the binding constraint in every run to date.
 
-2. **Cost estimates are catalog-size dependent.** Observed cost ranged from 10 to 20 points depending on query depth. Actual cost scales with returned nodes, so no figure here is a constant.
+2. **Cost estimates are catalog-size dependent.** Observed cost ranged from 7 to 20 points depending on query depth. Actual cost scales with returned nodes, so no figure here is a constant.
 
-3. **The rate limiter is untested under real pressure.** See *Measured behaviour* — no workload run so far has come close to draining the bucket. The waiting path has never executed against a genuine limit, only against a stubbed 429.
+3. **The rate limiter is untested under real pressure.** See *Measured behaviour* — no workload so far has come close to draining the bucket. The waiting path has never executed against a genuine limit, only against a stubbed 429.
 
 4. **Single store per process.** `getConfig()` memoizes into module scope and `shopify.ts` exports one shared limiter instance. `RateLimiter` is a class and would need no changes; the config layer would.
 
@@ -202,13 +222,13 @@ Following the `sysexits` convention so a scheduler can distinguish failure class
 
 7. **No scope preflight.** Scripts discover missing permissions when a mutation is denied mid-run. `check-scopes.ts` exists but must be run manually.
 
-8. **Nested connection depth is fixed.** `inventoryLevels(first: 20)`, `variants(first: 10)`, and `metafields(first: 10)` are hardcoded. Stores exceeding those limits are under-reported; only the inventory case surfaces a count.
+8. **Nested connection depth is fixed outside bulk queries.** `inventoryLevels(first: 20)`, `variants(first: 10)`, and `metafields(first: 10)` are hardcoded in the paginated scripts. Bulk queries have no such constraint and return every nested node, so this only affects code not yet moved to bulk.
 
 9. **Teardown has a check-then-act race.** `collectIds()` and the delete loop are separate steps. Any product created between them is absent from the collected list and survives, while the script reports complete success. Observed by accidentally running generate and teardown concurrently — teardown reported `Deleted: 2, Failed: 0` and left a product behind.
 
-10. **Generated products have no inventory.** `productSet` sets `tracked: true` but never creates inventory levels, so all 2,000 generated products show 0 in stock. Fine for read and pagination testing, useless for inventory logic testing.
+10. **Generated products have no inventory.** `productSet` sets `tracked: true` but never creates inventory levels, so all 2,000 generated products show 0 in stock. Fine for read and pagination testing, useless for inventory logic testing — `inventory-report.ts` is still only exercised against the 17 seeded products.
 
-11. **No bulk export.** Everything uses cursor pagination, which is correct at this scale and wrong at tens of thousands of records.
+11. **Bulk error paths are untested.** `FAILED`, `EXPIRED`, and `partialDataUrl` handling is written but has never executed — every run has completed cleanly. The timeout path is likewise unexercised.
 
 12. **No persistence.** Results are printed to stdout and discarded.
 
@@ -223,10 +243,10 @@ Following the `sysexits` convention so a scheduler can distinguish failure class
 - ~~`retry.ts` is unsafe for mutations~~ — retry is now opt-in per operation, driven by explicit idempotency classification.
 - ~~Read-only~~ — write path implemented with `userErrors` handling and idempotency proven empirically.
 - ~~Catalog too small to test at scale~~ — 2,000 generated products with 6,014 variants.
+- ~~No bulk export~~ — implemented with JSONL streaming and verified against the paginated implementation.
 
 ## Roadmap
 
-- Bulk Operations for large catalogs
-- Fulfillment orders and location routing
 - Postgres persistence via Prisma
+- Fulfillment orders and location routing
 - Webhook receiver with HMAC verification and idempotent handlers
