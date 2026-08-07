@@ -31,7 +31,6 @@ export const ThrottleEnvelopeSchema = z.object({
   extensions: z.object({ cost: CostSchema }),
 });
 
-/** GraphQL errors arrive with HTTP 200, so they need their own schema. */
 export const GraphQLErrorSchema = z.object({
   message: z.string(),
   extensions: z
@@ -54,6 +53,20 @@ export const PageInfoSchema = z.object({
   hasNextPage: z.boolean(),
   endCursor: z.string().nullable(),
 });
+
+// ---------- Mutations ----------
+
+/**
+ * Mutations report business-rule failures in `userErrors`, not in the
+ * top-level `errors` array. HTTP is 200 and `errors` is absent.
+ */
+export const UserErrorSchema = z.object({
+  field: z.array(z.string()).nullable(),
+  message: z.string(),
+  code: z.string().nullable().optional(),
+});
+
+export type UserError = z.infer<typeof UserErrorSchema>;
 
 // ---------- first-query.ts ----------
 
@@ -236,6 +249,88 @@ export const VariantsPageSchema = z.object({
       productVariants: z.object({
         pageInfo: PageInfoSchema,
         nodes: z.array(VariantWithInventorySchema),
+      }),
+    })
+    .optional(),
+  errors: z.unknown().optional(),
+});
+
+// ---------- metafields.ts ----------
+
+export const MetafieldDefinitionSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  namespace: z.string(),
+  key: z.string(),
+  description: z.string().nullable(),
+  type: z.object({ name: z.string() }),
+  ownerType: z.string(),
+});
+
+export type MetafieldDefinition = z.infer<typeof MetafieldDefinitionSchema>;
+
+export const DefinitionCreateResponseSchema = z.object({
+  data: z
+    .object({
+      metafieldDefinitionCreate: z.object({
+        createdDefinition: MetafieldDefinitionSchema.nullable(),
+        userErrors: z.array(UserErrorSchema),
+      }),
+    })
+    .optional(),
+  errors: z.unknown().optional(),
+});
+
+export const DefinitionListResponseSchema = z.object({
+  data: z
+    .object({
+      metafieldDefinitions: z.object({
+        nodes: z.array(MetafieldDefinitionSchema),
+      }),
+    })
+    .optional(),
+  errors: z.unknown().optional(),
+});
+
+export const MetafieldValueSchema = z.object({
+  id: z.string(),
+  namespace: z.string(),
+  key: z.string(),
+  value: z.string(),
+  type: z.string(),
+  updatedAt: z.string(),
+});
+
+export type MetafieldValue = z.infer<typeof MetafieldValueSchema>;
+
+export const MetafieldsSetResponseSchema = z.object({
+  data: z
+    .object({
+      metafieldsSet: z.object({
+        metafields: z.array(MetafieldValueSchema),
+        userErrors: z.array(UserErrorSchema),
+      }),
+    })
+    .optional(),
+  errors: z.unknown().optional(),
+});
+
+export const ProductWithMetafieldsSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  metafields: z.object({
+    nodes: z.array(MetafieldValueSchema),
+  }),
+});
+
+export type ProductWithMetafields = z.infer<typeof ProductWithMetafieldsSchema>;
+
+export const ProductsWithMetafieldsPageSchema = z.object({
+  data: z
+    .object({
+      products: z.object({
+        pageInfo: PageInfoSchema,
+        nodes: z.array(ProductWithMetafieldsSchema),
       }),
     })
     .optional(),

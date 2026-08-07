@@ -120,7 +120,6 @@ function readCost(body: unknown): Cost | null {
   return envelope.success ? envelope.data.extensions.cost : null;
 }
 
-/** THROTTLED arrives as HTTP 200 with an errors array — not a 429. */
 function findThrottleError(body: unknown): string | null {
   const parsed = GraphQLErrorEnvelopeSchema.safeParse(body);
   if (!parsed.success || !parsed.data.errors) return null;
@@ -138,84 +137,91 @@ export interface GraphQLResult {
   cost: ThrottleStatus | null;
 }
 
+export interface GraphQLOptions {
+  /** Set false for non-idempotent writes that must not be replayed. */
+  retry?: boolean;
+}
+
 export async function shopifyGraphQL(
   query: string,
-  variables?: Record<string, unknown>
+  variables?: Record<string, unknown>,
+  options: GraphQLOptions = {}
 ): Promise<GraphQLResult> {
   const { shop, apiVersion } = getConfig();
+  const { retry = true } = options;
 
-  return withRetry(
-    async () => {
-      const token = await getAccessToken();
+  const execute = async (): Promise<GraphQLResult> => {
+    const token = await getAccessToken();
 
-      await limiter.acquire();
+    await limiter.acquire();
 
-      let body: unknown;
-      let res: Response;
+    let body: unknown;
 
-      try {
-        res = await fetch(
-          `https://${shop}/admin/api/${apiVersion}/graphql.json`,
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'X-Shopify-Access-Token': token,
-            },
-            body: JSON.stringify(variables ? { query, variables } : { query }),
-          }
-        );
-
-        if (res.status === 401) {
-          invalidateToken();
-          throw new RetryableHttpError(
-            'Access token was rejected — refreshing',
-            401,
-            null
-          );
+    try {
+      const res = await fetch(
+        `https://${shop}/admin/api/${apiVersion}/graphql.json`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Shopify-Access-Token': token,
+          },
+          body: JSON.stringify(variables ? { query, variables } : { query }),
         }
+      );
 
-        if (!res.ok) {
-          if (isTransientStatus(res.status)) {
-            throw new RetryableHttpError(
-              `Admin API request failed with status ${res.status}`,
-              res.status,
-              parseRetryAfter(res)
-            );
-          }
-
-          throw new ShopifyApiError(
-            `Admin API request failed with status ${res.status}`,
-            await summarizeErrorBody(res)
-          );
-        }
-
-        body = await res.json();
-      } finally {
-        limiter.release();
-      }
-
-      const cost = readCost(body);
-      const throttleMessage = findThrottleError(body);
-
-      if (throttleMessage) {
-        limiter.markThrottled(cost?.throttleStatus);
-
-        const waitMs = limiter.waitTimeFor(cost?.requestedQueryCost ?? 100);
-
+      if (res.status === 401) {
+        invalidateToken();
         throw new RetryableHttpError(
-          `Throttled by Shopify: ${throttleMessage}`,
-          429,
-          Math.max(waitMs, 1000)
+          'Access token was rejected — refreshing',
+          401,
+          null
         );
       }
 
-      if (cost) {
-        limiter.record(cost.throttleStatus, cost.actualQueryCost ?? undefined);
+      if (!res.ok) {
+        if (isTransientStatus(res.status)) {
+          throw new RetryableHttpError(
+            `Admin API request failed with status ${res.status}`,
+            res.status,
+            parseRetryAfter(res)
+          );
+        }
+
+        throw new ShopifyApiError(
+          `Admin API request failed with status ${res.status}`,
+          await summarizeErrorBody(res)
+        );
       }
 
-      return { body, cost: cost?.throttleStatus ?? null };
-    },
-    { label: 'admin graphql', maxAttempts: 5 }
-  );
+      body = await res.json();
+    } finally {
+      limiter.release();
+    }
+
+    const cost = readCost(body);
+    const throttleMessage = findThrottleError(body);
+
+    if (throttleMessage) {
+      limiter.markThrottled(cost?.throttleStatus);
+
+      const waitMs = limiter.waitTimeFor(cost?.requestedQueryCost ?? 100);
+
+      throw new RetryableHttpError(
+        `Throttled by Shopify: ${throttleMessage}`,
+        429,
+        Math.max(waitMs, 1000)
+      );
+    }
+
+    if (cost) {
+      limiter.record(cost.throttleStatus, cost.actualQueryCost ?? undefined);
+    }
+
+    return { body, cost: cost?.throttleStatus ?? null };
+  };
+
+  if (!retry) return execute();
+
+  return withRetry(execute, { label: 'admin graphql', maxAttempts: 5 });
 }
