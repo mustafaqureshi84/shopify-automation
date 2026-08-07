@@ -1,6 +1,6 @@
 # Shopify Automation Lab
 
-A learning project for building reliable Shopify integrations against the GraphQL Admin API. The focus is not "make a request work" — it's what a request needs around it to run unattended: runtime validation, typed errors, retry with backoff, and meaningful exit codes.
+A learning project for building reliable Shopify integrations against the GraphQL Admin API. The focus is not "make a request work" — it's what a request needs around it to run unattended: runtime validation, typed errors, retry with backoff, adaptive rate limiting, and meaningful exit codes.
 
 ## Stack
 
@@ -49,8 +49,15 @@ SHOPIFY_CLIENT_SECRET=
 ## Scripts
 
 ```bash
-npx tsx src/first-query.ts      # list 10 products with variant counts
-npx tsx src/async-patterns.ts   # compare sequential / parallel / bounded concurrency
+npx tsx src/first-query.ts       # minimal single query — 10 products
+npx tsx src/export-products.ts   # full catalog via cursor pagination
+npx tsx src/async-patterns.ts    # concurrency benchmark, 4 strategies
+```
+
+`export-products.ts` accepts `PAGE_SIZE` to control page size:
+
+```bash
+PAGE_SIZE=250 npx tsx src/export-products.ts
 ```
 
 ## Structure
@@ -60,10 +67,16 @@ npx tsx src/async-patterns.ts   # compare sequential / parallel / bounded concur
 | `src/config.ts` | Reads and validates env vars; memoized, throws `ConfigError` naming every missing variable |
 | `src/errors.ts` | `ConfigError`, `ShopifyAuthError`, `ShopifyApiError` |
 | `src/retry.ts` | `withRetry` with exponential backoff and jitter; `RetryExhaustedError` |
-| `src/shopify.ts` | Token acquisition and caching, GraphQL transport, error body summarizing |
+| `src/exit.ts` | Maps any thrown error to a log line and exit code |
+| `src/rate-limiter.ts` | Leaky-bucket model; gates requests, tracks cost, derives concurrency |
+| `src/shopify.ts` | Transport layer — the only file that calls `fetch` |
+| `src/paginate.ts` | Generic cursor-pagination async generators |
 | `src/types.ts` | Zod schemas; TypeScript types derived via `z.infer` |
-| `src/first-query.ts` | Minimal product query |
-| `src/async-patterns.ts` | Concurrency comparison with throttle reporting |
+| `src/first-query.ts` | Script: minimal query example |
+| `src/export-products.ts` | Script: paginated catalog export |
+| `src/async-patterns.ts` | Script: concurrency benchmark |
+
+Dependencies flow one direction. `types.ts` and `errors.ts` have no dependencies; scripts sit at the top.
 
 ## Design notes
 
@@ -75,7 +88,13 @@ npx tsx src/async-patterns.ts   # compare sequential / parallel / bounded concur
 
 **Backoff includes jitter.** Delays land between roughly 85% and 115% of target so concurrent failures don't retry in lockstep.
 
-**Token caching expires early.** A 300-second safety margin is subtracted from the token lifetime to avoid a token expiring between the validity check and the request reaching Shopify.
+**Token caching expires early.** A 300-second safety margin is subtracted from the token lifetime to avoid a token expiring between the validity check and the request reaching Shopify. A 401 mid-run invalidates the cache and retries.
+
+**`THROTTLED` arrives as HTTP 200.** Shopify returns rate-limit rejections in the GraphQL `errors` array with a normal status code, so `res.ok` checks miss them entirely. They are detected by inspecting the response body and converted into a retryable error carrying a computed wait.
+
+**Rate limiting is adaptive, not configured.** The limiter reads `throttleStatus` from every response, extrapolates refill from elapsed time, and reserves points before admitting a request. Concurrency is derived as `restoreRate ÷ estimatedCost` rather than hardcoded. A 20% reserve is held back so this client doesn't starve other processes sharing the same store's bucket.
+
+**Cost estimation biases toward the peak.** The estimate is the midpoint of the mean and maximum observed cost, because underestimating causes throttles while overestimating only costs a little throughput.
 
 ## Exit codes
 
@@ -92,27 +111,32 @@ Following the `sysexits` convention so a scheduler can distinguish failure class
 
 ## Known limitations
 
-1. **No token invalidation on 401.** If a cached token is rejected mid-run, the cache is not cleared and the request cannot self-heal. A 401 should invalidate the cache and trigger one retry; it currently fails as permanent.
+1. **Concurrency ceiling is arbitrary.** `suggestedConcurrency()` derives a rate from `restoreRate ÷ estimatedCost` but caps the result at 20. On a Plus store the uncapped figure is around 90, so the cap — not the bucket — is the binding constraint. The number was chosen for safety, not measured.
 
-2. **Concurrency limit is hardcoded.** `mapWithConcurrency` takes a fixed limit of 3. Shopify returns `throttleStatus` on every response — a correct client would derive its rate from `currentlyAvailable` and `restoreRate` and slow down as the bucket drains.
+2. **Cost estimates are catalog-size dependent.** The observed cost of ~11 points reflects a 17-product store. Actual query cost scales with returned nodes, so the same query against a 4,000-product catalog costs substantially more. The limiter adapts, but any figure recorded here is not a constant.
 
-3. **Only tested against a Plus development store.** That store has a 20,000-point bucket restoring at 1000/sec. A Basic-plan store has 100 points at 50/sec. The unbounded `Promise.all` path appeared safe here purely because of that headroom and would be throttled immediately on a standard plan.
+3. **Only tested against a Plus development store.** That store has a 20,000-point bucket restoring at 1000/sec. A Basic-plan store has 100 points at 50/sec. Benchmarks used under 3% of available capacity, so throttling behaviour has never actually been exercised against a real limit — only against a simulated one.
 
-4. **Throttle reporting understates pressure.** `async-patterns.ts` records the throttle status from the last response to return, not the minimum observed. Under parallelism the bucket has already partially refilled by then.
+4. **Single store per process.** `getConfig()` memoizes into module scope and `shopify.ts` exports one shared limiter instance, so this cannot talk to two shops in one run. `RateLimiter` is a class and would need no changes; the config layer would.
 
-5. **Single store per process.** `getConfig()` memoizes into module scope, so this cannot talk to two shops in one run. A multi-store integration would need config passed explicitly rather than imported.
+5. **No adaptive backoff on repeated throttling.** A sustained throttle is retried with the same computed wait each time. There is no escalation if the store is under pressure from another client.
 
-6. **Read-only.** No mutations are performed. Nothing here has been tested against write scopes or idempotency requirements.
+6. **Read-only.** No mutations are performed. Nothing here has been tested against write scopes, and idempotency has not been considered.
 
-7. **No pagination.** Queries are capped at the first 10–50 records. Anything at real catalog scale needs cursor pagination or the Bulk Operations API.
+7. **No persistence.** Results are printed to stdout and discarded.
 
-8. **No persistence.** Results are printed to stdout and discarded.
+8. **No tests.** Failure paths were verified manually by breaking credentials, pointing `SHOP_DOMAIN` at an unresolvable host, and stubbing a 429 response.
 
-9. **No tests.** Failure paths were verified manually by breaking credentials and pointing `SHOP_DOMAIN` at an unresolvable host.
+## Resolved
+
+- ~~No token invalidation on 401~~ — a rejected token now clears the cache and retries.
+- ~~Concurrency limit is hardcoded~~ — now derived from observed cost and restore rate.
+- ~~Throttle reporting understates pressure~~ — replaced by a limiter that extrapolates rather than trusting the last reading.
 
 ## Roadmap
 
-- Adaptive rate limiting driven by `throttleStatus`
-- Cursor pagination and Bulk Operations
+- Shopify object graph: inventory, fulfillment orders, locations
+- Metafields and metaobjects
+- Bulk Operations for large catalogs
 - Postgres persistence via Prisma
 - Webhook receiver with HMAC verification and idempotent handlers
