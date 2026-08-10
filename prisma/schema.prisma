@@ -1,0 +1,82 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// A product as it exists in Shopify, mirrored locally.
+/// The Shopify GID is the primary key — it is stable, opaque, and already
+/// unique within a shop. `shopDomain` is carried from the start so a
+/// composite key can be introduced for multi-store without restructuring.
+model Product {
+  gid            String   @id
+  shopDomain     String
+  handle         String
+  title          String
+  status         String
+  totalInventory Int?
+
+  /// Set when a sync run no longer sees this product. Deletion in Shopify
+  /// produces no event — absence from a full snapshot is the only signal.
+  deletedAt      DateTime?
+
+  /// The sync run that last touched this row, for change detection.
+  lastSeenAt     DateTime
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  variants       Variant[]
+
+  @@index([shopDomain, status])
+  @@index([deletedAt])
+  @@index([lastSeenAt])
+}
+
+/// A product variant. SKU is deliberately NOT unique — Shopify does not
+/// enforce SKU uniqueness, and a constraint here would reject valid data.
+model Variant {
+  gid             String   @id
+  productGid      String
+  shopDomain      String
+  sku             String?
+  price           Decimal? @db.Decimal(12, 2)
+  inventoryItemId String?
+
+  deletedAt       DateTime?
+  lastSeenAt      DateTime
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  product         Product  @relation(fields: [productGid], references: [gid], onDelete: Cascade)
+
+  @@index([productGid])
+  @@index([sku])
+  @@index([shopDomain])
+}
+
+/// One row per sync execution. Makes "what changed since last time"
+/// answerable, and records failures rather than leaving a silent gap.
+model SyncRun {
+  id            String    @id @default(uuid())
+  shopDomain    String
+  startedAt     DateTime  @default(now())
+  finishedAt    DateTime?
+  status        String    @default("running")
+
+  productsSeen      Int @default(0)
+  productsCreated   Int @default(0)
+  productsUpdated   Int @default(0)
+  productsUnchanged Int @default(0)
+  productsDeleted   Int @default(0)
+  variantsSeen      Int @default(0)
+
+  error         String?
+
+  @@index([shopDomain, startedAt])
+}
