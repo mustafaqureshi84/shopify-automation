@@ -30,7 +30,7 @@ A learning project for building reliable Shopify integrations against the GraphQ
 
 Permanent `shpat_` tokens are no longer issued from the Shopify admin. Tokens are requested at runtime via the client credentials grant and are valid for 24 hours.
 
-**Scope changes require reinstalling the app.** Releasing a new version updates the app's declared scopes, but an existing installation retains the grant it was authorized under, and tokens are issued against the installation. Run `check-scopes.ts` to see what a token actually holds.
+**Scope changes require reinstalling the app.** Releasing a new version updates the app's declared scopes, but an existing installation retains the grant it was authorized under, and tokens are issued against the installation. Every write script asserts its required scopes at startup and exits 77 with the missing list.
 
 ### Install
 
@@ -67,17 +67,20 @@ npx tsx src/inventory-report.ts    # per-location stock, quantity-name audit
 npx tsx src/metafields.ts          # definition lifecycle, mutations, idempotency proof
 npx tsx src/generate-products.ts   # create synthetic catalog data
 npx tsx src/populate-inventory.ts  # activate inventory and set on_hand quantities
-npx tsx src/teardown-products.ts   # delete generated data (requires CONFIRM=yes)
+npx tsx src/teardown-products.ts   # delete ALL generated data (requires CONFIRM=yes)
 ```
 
 Environment overrides:
 
 ```bash
+LIMIT=5                            # sample mode — process N items and stop
 PAGE_SIZE=250                      # export-products.ts page size
 COUNT=2000 START_AT=21 SEED=42     # generate-products.ts
 SEED=7                             # populate-inventory.ts distribution
 CONFIRM=yes                        # teardown-products.ts safety gate
 ```
+
+`LIMIT` exists because two twenty-minute runs died on mutation shapes a five-item sample would have caught in seconds. Use it whenever a write script changes.
 
 **PowerShell note:** `$env:VAR` persists for the terminal session only. A stale `PAGE_SIZE=2` turned a 6-second export into a 9-minute one more than once.
 
@@ -90,6 +93,7 @@ CONFIRM=yes                        # teardown-products.ts safety gate
 | `src/errors.ts` | `ConfigError`, `ShopifyAuthError`, `ShopifyApiError` |
 | `src/retry.ts` | `withRetry` with exponential backoff and jitter; `RetryExhaustedError` |
 | `src/exit.ts` | `describeError` renders any thrown value; `handleFatal` adds the exit code |
+| `src/preflight.ts` | `assertScopes` startup guard; `applyLimit` sample-mode convention |
 | `src/rate-limiter.ts` | Leaky-bucket model; gates requests, tracks cost, derives concurrency |
 | `src/shopify.ts` | Transport layer — the only file that calls `fetch` |
 | `src/mutations.ts` | Write path: `userErrors` handling, idempotency classification, `requireData` |
@@ -116,13 +120,13 @@ Dependencies flow one direction. `constants.ts`, `types.ts`, and `errors.ts` hav
 
 Three tables: `Product`, `Variant`, `SyncRun`.
 
-**Shopify GID is the primary key.** A surrogate key would cost a lookup on every upsert and buys nothing until a second store exists. Multi-store is handled by the `shopDomain` column already present, which can be promoted to a composite unique constraint `(shopDomain, gid)` in a later migration without restructuring relationships.
+**Shopify GID is the primary key.** A surrogate key would cost a lookup on every upsert and buys nothing until a second store exists. Multi-store is handled by the `shopDomain` column already present, which can be promoted to a composite unique constraint `(shopDomain, gid)` later without restructuring relationships.
 
-**`sku` is indexed but not unique.** Shopify does not enforce SKU uniqueness, and a constraint here would reject data that legitimately exists in the store. Constraints must match the source system's actual guarantees, not the ones you wish it had.
+**`sku` is indexed but not unique.** Shopify does not enforce SKU uniqueness, and a constraint here would reject data that legitimately exists — 23 seeded variants have no SKU at all. Constraints must match the source system's actual guarantees, not the ones you wish it had.
 
-**Soft deletes via `deletedAt`.** A hard delete discards the fact that something once existed and when it vanished, which is unrecoverable if a sync run was incomplete.
+**Soft deletes via `deletedAt`.** A hard delete discards the fact that something once existed and when it vanished. A full catalog replacement marked 2,000 rows deleted; that history would otherwise be gone.
 
-**`lastSeenAt` is the deletion mechanism.** Every row touched by a run is stamped with that run's start time. Anything still holding an older timestamp was absent from the snapshot and is marked deleted.
+**`lastSeenAt` is the deletion mechanism.** Every row touched by a run is stamped with that run's start time. Anything still holding an older timestamp was absent from the snapshot.
 
 **Money is `Decimal(12,2)`, never `Float`.** Binary floating point cannot represent 0.1 exactly.
 
@@ -134,37 +138,39 @@ Three tables: `Product`, `Variant`, `SyncRun`.
 
 **When the same "user error" recurs repeatedly, it usually isn't user error.**
 
-**Batch database writes into single statements.** 500 individual `prisma.upsert()` calls inside one transaction is 500 sequential round trips — about 5.7 seconds against a remote database, exceeding Prisma's 5-second transaction timeout. Rewritten as one `INSERT ... ON CONFLICT DO UPDATE` per batch, the full 2,017-product catalog writes in 9 seconds. **When a timeout fires, ask why the work is slow before making the deadline longer** — raising the timeout would have produced a sync that took minutes at this scale and hours at a real one.
+**Fail fast on missing permissions.** `assertScopes` costs one API call at startup. It replaced two failed runs — nine and twenty minutes — that were never going to succeed. Cheap checks preventing expensive failures are almost always worth it; the ratio here is roughly 6,000:1.
 
-**Raw SQL is parameterised via `Prisma.sql` and `Prisma.join`.** Every value becomes a bound parameter. Building the same statement with template literals and `.join(',')` would be an injection hole, and product titles are merchant-controlled text.
+**Batch database writes into single statements.** 500 individual `prisma.upsert()` calls inside one transaction is 500 sequential round trips — about 5.7 seconds against a remote database, exceeding Prisma's 5-second transaction timeout. Rewritten as one `INSERT ... ON CONFLICT DO UPDATE` per batch, the full 2,017-product catalog writes in 9 seconds. **When a timeout fires, ask why the work is slow before making the deadline longer.**
+
+**Raw SQL is parameterised via `Prisma.sql` and `Prisma.join`.** Every value becomes a bound parameter. Template literals with `.join(',')` would be an injection hole, and product titles are merchant-controlled text.
 
 **Change detection compares against a snapshot loaded up front.** One `findMany` into a `Map` rather than 2,017 individual existence checks.
 
-**Sync runs are recorded, including failures.** A crash that leaves no trace makes "did it run last night" unanswerable. The `SyncRun` table holds counts, duration, and the error text for failed runs.
+**Sync runs are recorded, including failures.** A crash that leaves no trace makes "did it run last night" unanswerable.
 
-**Validation at the boundary.** Every response is parsed with `safeParse` before use. There are no `as` type assertions — types are a consequence of validation rather than a promise to the compiler.
+**Validation at the boundary.** Every response is parsed with `safeParse` before use. There are no `as` type assertions.
 
-**Three separate error channels.** HTTP status, the GraphQL `errors` array, and mutation `userErrors`. All three must be checked. A mutation rejected by a business rule returns HTTP 200 with no `errors` array.
+**Three separate error channels.** HTTP status, the GraphQL `errors` array, and mutation `userErrors`. A mutation rejected by a business rule returns HTTP 200 with no `errors` array.
 
-**Errors are checked before shape.** `requireData` inspects the `errors` array before validating structure, because a rejected request frequently returns `null` data *as a consequence* of the error.
+**Errors are checked before shape.** A rejected request frequently returns `null` data *as a consequence* of the error; validating first surfaces Zod's inference instead of the API's explanation.
 
-**Error description lives in one place.** `describeError` renders any thrown value with the detail its class carries; `handleFatal` wraps it with an exit code. Call sites that write their own summaries drop the useful part — this happened twice before the logic was extracted.
+**Error description lives in one place.** `describeError` renders any thrown value with the detail its class carries. Call sites that write their own summaries drop the useful part — this happened twice before the logic was extracted.
 
-**Retry decisions are status-based, not text-based.** 429 and 5xx retry; 4xx does not. Shopify's error pages contain reassuring prose like "this store will be right back" even for stores that never existed.
+**Retry decisions are status-based, not text-based.** Shopify's error pages contain reassuring prose like "this store will be right back" even for stores that never existed.
 
 **`Retry-After` overrides local backoff.** Backoff includes jitter so concurrent failures don't retry in lockstep.
 
-**Token caching expires early.** A 300-second safety margin avoids a token expiring between the validity check and the request arriving. A 401 mid-run invalidates the cache and retries.
+**Token caching expires early.** A 300-second safety margin avoids a token expiring in flight. A 401 mid-run invalidates the cache and retries.
 
 **`THROTTLED` arrives as HTTP 200** in the GraphQL `errors` array, so `res.ok` checks miss it entirely.
 
-**Rate limiting is adaptive, not configured.** The limiter reads `throttleStatus` from every response, extrapolates refill from elapsed time, and reserves points before admitting a request. A 20% reserve is held back so this client doesn't starve other processes sharing the bucket.
+**Rate limiting is adaptive, not configured.** The limiter reads `throttleStatus` from every response, extrapolates refill from elapsed time, and reserves points before admitting a request. A 20% reserve protects other processes sharing the bucket.
 
-**Retry is opt-in per operation.** `mutate` sets it from an explicit `idempotency` argument. Idempotency is a property of the operation, not something a wrapper can add.
+**Retry is opt-in per operation.** Idempotency is a property of the operation, not something a wrapper can add.
 
-**Bulk writes record per-item outcomes rather than throwing.** One failure at item 1,400 does not abandon the rest. At scale, partial success is the normal case.
+**Bulk writes record per-item outcomes rather than throwing.** At scale, partial success is the normal case.
 
-**JSONL parsing must handle chunk boundaries.** Network chunks do not align with newlines. Splitting each chunk on `\n` independently produces corrupt JSON on any file large enough to span chunks.
+**JSONL parsing must handle chunk boundaries.** Network chunks do not align with newlines.
 
 **Bulk results are grouped by streaming, not buffering.** Works at 2,000 products and at 500,000.
 
@@ -186,11 +192,11 @@ Findings verified against a live development store, not taken from documentation
 
 **`totalInventory` reflects `available`, not `on_hand`.**
 
-**Location capability is a filter, not metadata.** 38,312 of 234,204 units sit at a `shipsInventory: false` location — 16% of stock, real but unfulfillable online. Summing `available` across locations overstates sellable inventory.
+**Location capability is a filter, not metadata.** 38,312 of 234,204 units sit at a `shipsInventory: false` location — 16% of stock, real but unfulfillable online.
 
 **Deactivated locations still hold stock.** `locations` omits them unless `includeInactive: true`.
 
-**Shopify does not enforce SKU uniqueness.** Handles are auto-deduplicated; SKUs are not. 23 seeded variants have no SKU at all.
+**Shopify does not enforce SKU uniqueness.** Handles are auto-deduplicated; SKUs are not.
 
 **`userError` payload types differ per mutation.** `productCreate` and `productDelete` return plain `UserError`; `productSet` and `metafieldsSet` carry `code`; `inventoryActivate` has **no** `userErrors` field. Requesting a field that doesn't exist fails at query *validation*.
 
@@ -198,7 +204,7 @@ Findings verified against a live development store, not taken from documentation
 
 **`ignoreCompareQuantity` was removed in 2026-04.** Compare-and-swap moved to a per-quantity `changeFromQuantity`; `null` explicitly opts out, and the field must always be present. The unsafe path now requires deliberate repeated effort rather than one convenient flag.
 
-**Two sequential mutations have no transaction.** `productCreate` then `productVariantsBulkCreate` leaves an orphan when the second fails. `productSet` with `synchronous: true` is atomic.
+**Two sequential mutations have no transaction.** `productSet` with `synchronous: true` is atomic where `productCreate` + `productVariantsBulkCreate` is not.
 
 **Bulk queries use a different dialect.** `edges { node { } }` required; nested connections take no `first:` and return everything.
 
@@ -208,7 +214,7 @@ Findings verified against a live development store, not taken from documentation
 
 **`metafieldsSet` is an upsert**, matching on `ownerId` + `namespace` + `key`.
 
-**Granted scopes and declared scopes drift.** Reads worked normally while every mutation was denied. `currentAppInstallation.accessScopes` is ground truth. Cost an hour twice.
+**Granted scopes and declared scopes drift.** Reads worked normally while every mutation was denied. `currentAppInstallation.accessScopes` is ground truth.
 
 **Deletion produces no event.** A product removed from Shopify simply stops appearing in exports. An incremental sync filtering on `updatedAt` can never detect it — deleted rows have no update to find. Full-snapshot sync plus `lastSeenAt` is the only way to answer "what is no longer here."
 
@@ -216,9 +222,9 @@ Findings verified against a live development store, not taken from documentation
 
 **The client no longer bundles a database driver.** `new PrismaClient()` requires a driver adapter — `new PrismaClient({ adapter: new PrismaPg({ connectionString }) })`. `datasourceUrl` and `datasources` no longer exist.
 
-**`prisma.config.ts` configures the CLI only.** The `datasource` block in `schema.prisma` declares the provider; the runtime connection is established separately in application code.
+**`prisma.config.ts` configures the CLI only.** The `datasource` block in `schema.prisma` declares the provider; the runtime connection is established in application code.
 
-**The generated client is TypeScript source at a configured `output` path**, not a patch to `node_modules`. It is gitignored and rebuilt by `prisma generate`; `prisma/migrations/` is committed.
+**The generated client is TypeScript source at a configured `output` path.** It is gitignored and rebuilt by `prisma generate`; `prisma/migrations/` is committed.
 
 **`migrate dev` does not always emit the client.** Run `prisma generate` explicitly.
 
@@ -228,18 +234,21 @@ Plus development store: 20,000-point bucket, 1000/sec restore. Catalog of 2,017 
 
 | Workload | Result |
 |---|---|
-| 2,000 products via `productSet`, concurrency 4 | 8m 27s, 0 failures |
-| 6,014 variants activated + quantities set, concurrency 6 | 22m 23s, 0 failures |
+| 2,000 products via `productSet`, concurrency 4 | 8m 47s, 0 failures |
+| 6,014 variants activated + quantities set, concurrency 6 | 20m 10s, 0 failures |
 | 4,053 products deleted | 2m 38s, 0 failures |
 | Full read, `PAGE_SIZE=250` | 9 pages, 6.2s |
 | Full read, Bulk Operations | 6.2s + 2.2s parse, bucket stayed at 20,000 |
-| Full sync to Postgres, first run | 2,017 created + 6,040 variants in 9.0s |
-| Full sync to Postgres, second run | 2,017 unchanged in 12.3s |
+| Full sync to Postgres, initial load | 2,017 created + 6,040 variants in 9.0s |
+| Full sync, no changes | 2,017 unchanged in 12.3s |
+| Full sync, complete catalog replacement | 2,000 created, 17 unchanged, 1,999 + 6,012 deleted in 10.7s |
 | Query cost | 7–51 points depending on depth |
 
 **Four independent implementations agree exactly** on 2,017 products: paginated export, bulk export, inventory report, and the Postgres mirror.
 
-**Change detection verified.** Second run reports 0 created / 0 updated / 2,017 unchanged. **Deletion detection verified** by removing one product in the admin: the next run reported 2,016 seen, 1 newly deleted, 2 variants deleted, with no event from Shopify.
+**Change detection verified.** A no-op run reports 0 created / 0 updated / 2,017 unchanged.
+
+**Deletion detection verified at both scales.** Removing one product in the admin produced 1 newly deleted and 2 variants deleted. Replacing the entire catalog produced 1,999 products and 6,012 variants deleted, with the 17 seeded products correctly recognised as unchanged. Shopify sent no event in either case.
 
 **The rate limiter has never triggered.** The bucket never dropped below 19,800 in any run. On a Basic-plan store (100 points, 50/sec) the same workload would throttle within the first two products.
 
@@ -253,7 +262,7 @@ Plus development store: 20,000-point bucket, 1000/sec restore. Catalog of 2,017 
 | 65 | Data error — a mutation was rejected via `userErrors` |
 | 70 | API error — GraphQL errors, unexpected response shape, non-retryable HTTP failure |
 | 75 | Temporary failure — retries exhausted, or a retryable auth error |
-| 77 | Permission denied — credentials rejected; retrying will not help |
+| 77 | Permission denied — credentials rejected or a required scope not granted |
 | 78 | Configuration error — missing or invalid environment variables |
 | 1 | Unexpected error |
 
@@ -269,25 +278,23 @@ Plus development store: 20,000-point bucket, 1000/sec restore. Catalog of 2,017 
 
 5. **Single store per process.** `getConfig()` memoizes into module scope and `shopify.ts` exports one shared limiter. The schema is multi-store ready; the config layer is not.
 
-6. **Sync is full-snapshot only.** Every run reads the entire catalog. Correct, and the only way to detect deletions, but a 500,000-product store would want incremental updates for routine syncs and full snapshots only periodically for reconciliation.
+6. **Sync is full-snapshot only.** Every run reads the entire catalog. Correct, and the only way to detect deletions, but a 500,000-product store would want incremental updates for routine syncs and full snapshots periodically for reconciliation.
 
-7. **Inventory is not persisted.** `Product.totalInventory` is stored, but per-location `InventoryLevel` rows are not — so the database cannot answer the fulfillability question the inventory report can.
+7. **Inventory levels are not persisted.** `Product.totalInventory` is stored, but per-location `InventoryLevel` rows are not — so the database cannot answer the fulfillability question `inventory-report.ts` can.
 
-8. **No scope preflight.** Missing permissions surface mid-run. Cost two full runs.
+8. **Teardown cannot distinguish test data from real data.** Every generated product carries the same tag, so removing three sample products removes all two thousand. `LIMIT` made creating small batches safe; deleting them safely needs its own scoping — a per-run tag or a `--since` filter.
 
-9. **No dry-run or sample mode.** Two 20-minute runs died on errors a 5-variant sample would have caught in seconds.
+9. **Non-idempotent failures require manual reconciliation.** Nothing records the ambiguity for a human to resolve.
 
-10. **Non-idempotent failures require manual reconciliation.** Nothing records the ambiguity for a human to resolve.
+10. **No adaptive backoff on repeated throttling.**
 
-11. **No adaptive backoff on repeated throttling.**
+11. **Nested connection depth is fixed outside bulk queries.**
 
-12. **Nested connection depth is fixed outside bulk queries.**
+12. **Teardown has a check-then-act race.** Anything created between `collectIds()` and the delete loop survives while the script reports success.
 
-13. **Teardown has a check-then-act race.** Anything created between `collectIds()` and the delete loop survives while the script reports success.
+13. **Bulk error paths are untested.** `FAILED`, `EXPIRED`, `partialDataUrl`, and timeout handling have never executed.
 
-14. **Bulk error paths are untested.** `FAILED`, `EXPIRED`, `partialDataUrl`, and timeout handling have never executed.
-
-15. **No tests.** Failure paths verified manually: broken credentials, unresolvable hosts, stubbed 429s, an unfulfilled order to force committed stock, a deleted product to force deletion detection, and running every script twice.
+14. **No tests.** Failure paths verified manually: broken credentials, unresolvable hosts, stubbed 429s, an unfulfilled order to force committed stock, a deleted product and a full catalog replacement to force deletion detection, a fake required scope to verify the preflight guard, and running every script twice.
 
 ## Resolved
 
@@ -302,10 +309,13 @@ Plus development store: 20,000-point bucket, 1000/sec restore. Catalog of 2,017 
 - ~~Generated products have no inventory~~ — 234,274 units across two locations.
 - ~~Scripts appear to interfere when run concurrently~~ — root cause was a module side-effect import.
 - ~~No persistence~~ — Postgres mirror with create, update, and delete detection, all verified.
+- ~~No scope preflight~~ — every write script asserts required scopes at startup and exits 77 in about two seconds.
+- ~~No dry-run or sample mode~~ — shared `LIMIT` convention across write scripts.
 
 ## Roadmap
 
 - Persist inventory levels per location
-- Fulfillment orders and location routing
+- Shopify Flow: mapping where no-code breaks and code becomes necessary
 - Webhook receiver with HMAC verification and idempotent handlers
+- Fulfillment orders and location routing
 - Incremental sync with periodic full reconciliation
