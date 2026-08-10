@@ -8,7 +8,7 @@ import {
 import type { GeneratedProduct } from './types.js';
 import type { Connection } from './paginate.js';
 import { handleFatal, describeError } from './exit.js';
-import { GENERATED_TAG } from './generate-products.js';
+import { GENERATED_TAG } from './constants.js';
 
 const TAGGED_PRODUCTS = `
   query GeneratedProducts($first: Int!, $after: String) {

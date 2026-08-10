@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { mutate, requireData } from './mutations.js';
 import { limiter } from './shopify.js';
 import { paginate } from './paginate.js';
@@ -10,7 +11,7 @@ import {
 import type { Location, InventoryItemRef } from './types.js';
 import type { Connection } from './paginate.js';
 import { handleFatal, describeError } from './exit.js';
-import { GENERATED_TAG } from './generate-products.js';
+import { GENERATED_TAG } from './constants.js';
 
 const LOCATIONS_QUERY = `
   query AllLocations($first: Int!, $after: String) {
@@ -41,17 +42,27 @@ const VARIANT_ITEMS_QUERY = `
 `;
 
 /**
- * Stocking a variant at a location requires activating it there first.
- * Takes ONE locationId — there is no array form.
+ * Shopify requires an explicit @idempotent directive on inventory-mutating
+ * operations. The key is caller-supplied and deduplicated server-side, so a
+ * retried call after a lost response is a no-op rather than a second write.
+ *
+ * This payload has no userErrors field — requesting one fails validation.
  */
 const ACTIVATE = `
-  mutation ActivateInventory($inventoryItemId: ID!, $locationId: ID!) {
+  mutation ActivateInventory(
+    $inventoryItemId: ID!
+    $locationId: ID!
+    $idempotencyKey: String!
+  ) {
     inventoryActivate(
       inventoryItemId: $inventoryItemId
       locationId: $locationId
-    ) {
-      inventoryLevel { id }
-      userErrors { field message }
+    ) @idempotent(key: $idempotencyKey) {
+      inventoryLevel {
+        id
+        item { id }
+        location { id }
+      }
     }
   }
 `;
@@ -59,10 +70,20 @@ const ACTIVATE = `
 /**
  * `on_hand` is set rather than `available`. Available is derived —
  * on_hand minus committed — and is not directly settable.
+ *
+ * Each quantity carries `changeFromQuantity` for compare-and-swap. The
+ * mutation-level `ignoreCompareQuantity` flag was removed in 2026-04;
+ * passing `null` per quantity is now the explicit opt-out, and the field
+ * must always be present.
+ *
+ * Like inventoryActivate, this mutation also requires @idempotent.
  */
 const SET_QUANTITIES = `
-  mutation SetQuantities($input: InventorySetQuantitiesInput!) {
-    inventorySetQuantities(input: $input) {
+  mutation SetQuantities(
+    $input: InventorySetQuantitiesInput!
+    $idempotencyKey: String!
+  ) {
+    inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
       inventoryAdjustmentGroup {
         createdAt
         reason
@@ -143,9 +164,12 @@ async function applyPlan(plan: Plan): Promise<{ ok: boolean; error?: string }> {
     for (const locationId of plan.quantities.keys()) {
       const activateBody = await mutate(ACTIVATE, {
         mutationName: 'inventoryActivate',
-        // Activating an already-active item is a no-op.
         idempotency: 'idempotent',
-        variables: { inventoryItemId: plan.inventoryItemId, locationId },
+        variables: {
+          inventoryItemId: plan.inventoryItemId,
+          locationId,
+          idempotencyKey: randomUUID(),
+        },
       });
 
       requireData(
@@ -160,14 +184,18 @@ async function applyPlan(plan: Plan): Promise<{ ok: boolean; error?: string }> {
       // Absolute values, not deltas — replaying is safe.
       idempotency: 'idempotent',
       variables: {
+        idempotencyKey: randomUUID(),
         input: {
           name: 'on_hand',
           reason: 'other',
-          ignoreCompareQuantity: true,
           quantities: [...plan.quantities].map(([locationId, quantity]) => ({
             inventoryItemId: plan.inventoryItemId,
             locationId,
             quantity,
+            // Explicit null opts out of compare-and-swap. Correct here —
+            // we're setting initial values with no prior state to compare
+            // against. A real sync would pass the last-known quantity.
+            changeFromQuantity: null,
           })),
         },
       },

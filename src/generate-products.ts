@@ -2,8 +2,7 @@ import { mutate, requireData } from './mutations.js';
 import { limiter } from './shopify.js';
 import { ProductSetResponseSchema } from './types.js';
 import { handleFatal, describeError } from './exit.js';
-
-export const GENERATED_TAG = 'automation-lab-generated';
+import { GENERATED_TAG } from './constants.js';
 
 /**
  * One atomic call. `synchronous: true` makes Shopify complete the write
@@ -75,8 +74,7 @@ function buildSpec(index: number, rng: () => number): ProductSpec {
 
   const variants = colors.map((color, i) => ({
     color,
-    // Index in the SKU guarantees global uniqueness. Duplicate SKUs cause
-    // Shopify to silently replace products.
+    // Index in the SKU guarantees global uniqueness.
     sku: `AL-${String(index).padStart(5, '0')}-${i}`,
     price: (49 + Math.floor(rng() * 700)).toFixed(2),
   }));

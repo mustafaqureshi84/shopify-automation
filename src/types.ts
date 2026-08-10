@@ -492,15 +492,24 @@ export const VariantInventoryItemsPageSchema = z.object({
 });
 
 /**
- * inventoryActivate takes a single locationId, not an array. Stocking a
- * variant at N locations requires N calls.
+ * inventoryActivate takes a single locationId, not an array, and requires
+ * an @idempotent directive with a caller-supplied key. Shopify deduplicates
+ * on that key, so a replayed call is a no-op rather than a second write.
+ *
+ * Note: this mutation's payload has no `userErrors` field — requesting one
+ * fails at query validation.
  */
 export const InventoryActivateResponseSchema = z.object({
   data: z
     .object({
       inventoryActivate: z.object({
-        inventoryLevel: z.object({ id: z.string() }).nullable(),
-        userErrors: z.array(UserErrorSchema),
+        inventoryLevel: z
+          .object({
+            id: z.string(),
+            item: z.object({ id: z.string() }),
+            location: z.object({ id: z.string() }),
+          })
+          .nullable(),
       }),
     })
     .optional(),
