@@ -9,7 +9,7 @@ export class ShopifyAuthError extends Error {
   constructor(
     message: string,
     public readonly status: number,
-    public readonly body?: string
+    public readonly body?: string | undefined
   ) {
     super(message);
     this.name = 'ShopifyAuthError';

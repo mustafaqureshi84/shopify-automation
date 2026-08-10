@@ -1,8 +1,11 @@
 import { mutate, requireData } from './mutations.js';
 import { limiter } from './shopify.js';
+import { assertScopes, applyLimit } from './preflight.js';
 import { ProductSetResponseSchema } from './types.js';
 import { handleFatal, describeError } from './exit.js';
 import { GENERATED_TAG } from './constants.js';
+
+const REQUIRED_SCOPES = ['read_products', 'write_products'];
 
 /**
  * One atomic call. `synchronous: true` makes Shopify complete the write
@@ -168,20 +171,23 @@ async function mapWithConcurrency<T, R>(
 }
 
 async function main(): Promise<void> {
+  await assertScopes(REQUIRED_SCOPES);
+
   const total = Number(process.env.COUNT ?? 2000);
   const seed = Number(process.env.SEED ?? 42);
   const startAt = Number(process.env.START_AT ?? 1);
 
   const rng = makeRandom(seed);
-  const specs: ProductSpec[] = [];
+  const allSpecs: ProductSpec[] = [];
 
   for (let i = 0; i < total; i++) {
-    specs.push(buildSpec(startAt + i, rng));
+    allSpecs.push(buildSpec(startAt + i, rng));
   }
 
+  const specs = applyLimit(allSpecs, 'products');
   const variantTotal = specs.reduce((sum, s) => sum + s.variants.length, 0);
 
-  console.log(`Generating ${total} products (${variantTotal} variants)`);
+  console.log(`Generating ${specs.length} products (${variantTotal} variants)`);
   console.log(`Seed ${seed}, starting index ${startAt}\n`);
 
   console.time('generate');

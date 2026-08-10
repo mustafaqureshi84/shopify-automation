@@ -1,6 +1,7 @@
 import { mutate, requireData } from './mutations.js';
 import { paginate } from './paginate.js';
 import { limiter } from './shopify.js';
+import { assertScopes } from './preflight.js';
 import {
   GeneratedProductsPageSchema,
   ProductDeleteResponseSchema,
@@ -9,6 +10,8 @@ import type { GeneratedProduct } from './types.js';
 import type { Connection } from './paginate.js';
 import { handleFatal, describeError } from './exit.js';
 import { GENERATED_TAG } from './constants.js';
+
+const REQUIRED_SCOPES = ['read_products', 'write_products'];
 
 const TAGGED_PRODUCTS = `
   query GeneratedProducts($first: Int!, $after: String) {
@@ -85,6 +88,8 @@ async function main(): Promise<void> {
     console.log('  $env:CONFIRM="yes"; npx tsx src/teardown-products.ts');
     return;
   }
+
+  await assertScopes(REQUIRED_SCOPES);
 
   console.log(`Finding products tagged ${GENERATED_TAG}...`);
   const ids = await collectIds();

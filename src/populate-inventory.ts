@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mutate, requireData } from './mutations.js';
 import { limiter } from './shopify.js';
 import { paginate } from './paginate.js';
+import { assertScopes, applyLimit } from './preflight.js';
 import {
   LocationsPageSchema,
   VariantInventoryItemsPageSchema,
@@ -12,6 +13,13 @@ import type { Location, InventoryItemRef } from './types.js';
 import type { Connection } from './paginate.js';
 import { handleFatal, describeError } from './exit.js';
 import { GENERATED_TAG } from './constants.js';
+
+const REQUIRED_SCOPES = [
+  'read_products',
+  'read_locations',
+  'read_inventory',
+  'write_inventory',
+];
 
 const LOCATIONS_QUERY = `
   query AllLocations($first: Int!, $after: String) {
@@ -75,8 +83,6 @@ const ACTIVATE = `
  * mutation-level `ignoreCompareQuantity` flag was removed in 2026-04;
  * passing `null` per quantity is now the explicit opt-out, and the field
  * must always be present.
- *
- * Like inventoryActivate, this mutation also requires @idempotent.
  */
 const SET_QUANTITIES = `
   mutation SetQuantities(
@@ -251,6 +257,8 @@ async function mapWithConcurrency<T>(
 }
 
 async function main(): Promise<void> {
+  await assertScopes(REQUIRED_SCOPES);
+
   const seed = Number(process.env.SEED ?? 7);
   const rng = makeRandom(seed);
 
@@ -290,7 +298,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  const plans = variants.map((v) => buildPlan(v, shipping, nonShipping, rng));
+  const allPlans = variants.map((v) => buildPlan(v, shipping, nonShipping, rng));
+  const plans = applyLimit(allPlans, 'variants');
 
   const summary = { shipOnly: 0, both: 0, nonShipOnly: 0, zero: 0 };
   let plannedUnits = 0;
