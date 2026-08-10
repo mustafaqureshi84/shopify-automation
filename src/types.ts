@@ -467,3 +467,70 @@ export const BulkLineSchema = z.looseObject({
 });
 
 export type BulkLine = z.infer<typeof BulkLineSchema>;
+
+// ---------- populate-inventory.ts ----------
+
+export const InventoryItemRefSchema = z.object({
+  id: z.string(),
+  sku: z.string().nullable(),
+  inventoryItem: z.object({ id: z.string(), tracked: z.boolean() }),
+  product: z.object({ id: z.string(), tags: z.array(z.string()) }),
+});
+
+export type InventoryItemRef = z.infer<typeof InventoryItemRefSchema>;
+
+export const VariantInventoryItemsPageSchema = z.object({
+  data: z
+    .object({
+      productVariants: z.object({
+        pageInfo: PageInfoSchema,
+        nodes: z.array(InventoryItemRefSchema),
+      }),
+    })
+    .optional(),
+  errors: z.unknown().optional(),
+});
+
+/**
+ * inventoryActivate takes a single locationId, not an array. Stocking a
+ * variant at N locations requires N calls.
+ */
+export const InventoryActivateResponseSchema = z.object({
+  data: z
+    .object({
+      inventoryActivate: z.object({
+        inventoryLevel: z.object({ id: z.string() }).nullable(),
+        userErrors: z.array(UserErrorSchema),
+      }),
+    })
+    .optional(),
+  errors: z.unknown().optional(),
+});
+
+/**
+ * inventorySetQuantities replaces absolute values rather than adjusting
+ * deltas, which makes it idempotent — the same payload twice produces the
+ * same end state. inventoryAdjustQuantities is the delta variant and is not.
+ */
+export const InventorySetQuantitiesResponseSchema = z.object({
+  data: z
+    .object({
+      inventorySetQuantities: z.object({
+        inventoryAdjustmentGroup: z
+          .object({
+            createdAt: z.string(),
+            reason: z.string().nullable(),
+            changes: z.array(
+              z.object({
+                name: z.string(),
+                delta: z.number(),
+              })
+            ),
+          })
+          .nullable(),
+        userErrors: z.array(UserErrorSchema),
+      }),
+    })
+    .optional(),
+  errors: z.unknown().optional(),
+});
