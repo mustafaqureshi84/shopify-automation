@@ -67,6 +67,7 @@ npx tsx src/inventory-report.ts    # per-location stock, quantity-name audit
 npx tsx src/metafields.ts          # definition lifecycle, mutations, idempotency proof
 npx tsx src/generate-products.ts   # create synthetic catalog data
 npx tsx src/populate-inventory.ts  # activate inventory and set on_hand quantities
+npx tsx src/test-flow-trigger.ts   # set one variant's on_hand by SKU, printing before/after
 npx tsx src/teardown-products.ts   # delete ALL generated data (requires CONFIRM=yes)
 ```
 
@@ -77,6 +78,7 @@ LIMIT=5                            # sample mode — process N items and stop
 PAGE_SIZE=250                      # export-products.ts page size
 COUNT=2000 START_AT=21 SEED=42     # generate-products.ts
 SEED=7                             # populate-inventory.ts distribution
+SKU=AL-00500-0 TO=5                # test-flow-trigger.ts
 CONFIRM=yes                        # teardown-products.ts safety gate
 ```
 
@@ -102,6 +104,7 @@ CONFIRM=yes                        # teardown-products.ts safety gate
 | `src/db.ts` | Prisma client singleton with driver adapter — only file importing generated code |
 | `src/types.ts` | Zod schemas; TypeScript types derived via `z.infer` |
 | `src/check-scopes.ts` | Script: diagnostic for granted vs declared scopes |
+| `src/test-flow-trigger.ts` | Script: sets one variant's `on_hand` by SKU, printing before/after — isolates a single inventory change for testing downstream reactions |
 | `src/first-query.ts` | Script: minimal query example |
 | `src/export-products.ts` | Script: paginated catalog export |
 | `src/bulk-export.ts` | Script: bulk catalog export, cross-checked against pagination |
@@ -137,6 +140,8 @@ Three tables: `Product`, `Variant`, `SyncRun`.
 **Script modules must never be imported.** A file ending in `main().catch(...)` executes on import in ESM. `teardown-products.ts` imported `GENERATED_TAG` from `generate-products.ts` and thereby launched a full 2,000-product generation on every single run — silently, interleaved with its own output. The symptom looked exactly like operator error and was misdiagnosed as such for hours. Shared values now live in `constants.ts`.
 
 **When the same "user error" recurs repeatedly, it usually isn't user error.**
+
+**A negative result only means something once the boring explanations are ruled out.** Two separate wrong conclusions in this project came from a plausible story arriving before the evidence justified it. Ruling out the mundane cause is cheap; carrying a false finding is not.
 
 **Fail fast on missing permissions.** `assertScopes` costs one API call at startup. It replaced two failed runs — nine and twenty minutes — that were never going to succeed. Cheap checks preventing expensive failures are almost always worth it; the ratio here is roughly 6,000:1.
 
@@ -217,6 +222,18 @@ Findings verified against a live development store, not taken from documentation
 **Granted scopes and declared scopes drift.** Reads worked normally while every mutation was denied. `currentAppInstallation.accessScopes` is ground truth.
 
 **Deletion produces no event.** A product removed from Shopify simply stops appearing in exports. An incremental sync filtering on `updatedAt` can never detect it — deleted rows have no update to find. Full-snapshot sync plus `lastSeenAt` is the only way to answer "what is no longer here."
+
+### Shopify Flow
+
+**Flow triggers fire identically for admin edits and API writes.** Verified on both `Product created` (via `productSet`) and `Product variant inventory quantity changed` (via `inventorySetQuantities`). There is no admin-only behaviour.
+
+An earlier conclusion that inventory triggers ignored API changes was wrong, and the reasoning behind the error is worth keeping. A batch of ~60 API inventory writes produced zero workflow runs while a manual admin edit fired immediately — which looked like clear evidence of an API blind spot. The real cause was that the workflow used an edge-triggered condition, `inventoryQuantityPrior >= 10 AND inventoryQuantity < 10`, and no write in that randomly-distributed sample crossed the threshold from above. **Zero runs was correct behaviour, not a missing trigger.**
+
+Confirmed by isolating a single write: one variant taken from 21 to 5 via `inventorySetQuantities` fired the workflow immediately. `test-flow-trigger.ts` exists to make that kind of isolation cheap, printing the before-state alongside the change so a non-result can't be mistaken for a failure.
+
+**Edge-triggered conditions are the right pattern for threshold alerts.** Checking only `quantity < 10` fires on every subsequent change while the item stays low; adding the prior-value check fires once, on the transition. That is the difference between a useful alert and one people mute.
+
+**Flow can generate synthetic test events, including negative cases.** The test screen produced both an event satisfying the condition and one that does not, so a workflow can be validated without waiting for real activity — and the negative case matters as much as the positive. A workflow that fires when it should is half-verified; one that also stays quiet when it shouldn't is verified.
 
 ### Prisma 7 specifics
 
@@ -311,11 +328,12 @@ Plus development store: 20,000-point bucket, 1000/sec restore. Catalog of 2,017 
 - ~~No persistence~~ — Postgres mirror with create, update, and delete detection, all verified.
 - ~~No scope preflight~~ — every write script asserts required scopes at startup and exits 77 in about two seconds.
 - ~~No dry-run or sample mode~~ — shared `LIMIT` convention across write scripts.
+- ~~Flow inventory triggers appear blind to API writes~~ — false. The workflow's edge-triggered condition simply wasn't satisfied by the test data; an isolated 21→5 write fired it immediately.
 
 ## Roadmap
 
 - Persist inventory levels per location
-- Shopify Flow: mapping where no-code breaks and code becomes necessary
+- Shopify Flow: find where the tool genuinely breaks (loop caps, conditions that can't reference data outside the trigger's field set, no branching on external API responses)
 - Webhook receiver with HMAC verification and idempotent handlers
 - Fulfillment orders and location routing
 - Incremental sync with periodic full reconciliation
