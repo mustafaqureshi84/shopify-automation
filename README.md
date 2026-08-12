@@ -1,6 +1,6 @@
 # Shopify Automation Lab
 
-A learning project for building reliable Shopify integrations: a batch sync layer against the GraphQL Admin API, and an event-driven layer receiving webhooks. The focus is not "make a request work" — it's what a request needs around it to run unattended: runtime validation, typed errors, retry with backoff, adaptive rate limiting, idempotent writes, persistence with change detection, durable queues, and meaningful exit codes.
+A learning project for building reliable Shopify integrations: a batch sync layer against the GraphQL Admin API, an event-driven layer receiving webhooks, and an order pipeline that pushes to an external system. The focus is not "make a request work" — it's what a request needs around it to run unattended: runtime validation, typed errors, retry with backoff, adaptive rate limiting, idempotent writes, persistence with change detection, durable queues, and meaningful exit codes.
 
 ## Stack
 
@@ -9,7 +9,7 @@ A learning project for building reliable Shopify integrations: a batch sync laye
 - **Zod v4** for runtime validation
 - **Prisma 7** + **Postgres** (Neon) for persistence
 - **BullMQ** + **Redis** (Upstash) for the webhook queue
-- **Hono** for the HTTP receiver
+- **Hono** for the HTTP receiver and the ERP stub
 - **cloudflared** quick tunnels for local webhook delivery
 - **Shopify GraphQL Admin API** `2026-07` (REST is legacy and not used)
 - **OAuth client credentials** for authentication
@@ -32,10 +32,11 @@ A learning project for building reliable Shopify integrations: a batch sync laye
 3. Leave **Embed app in Shopify admin** unchecked — this app has no UI
 4. Leave **Use legacy install flow** unchecked (managed installation)
 5. Release the version, then install the app on your store
+6. For order data: **App setup → Protected customer data access**, select a data use in step 1
 
 Permanent `shpat_` tokens are no longer issued from the Shopify admin. Tokens are requested at runtime via the client credentials grant and are valid for 24 hours.
 
-**Scope changes require reinstalling the app.** Releasing a new version updates the app's declared scopes, but an existing installation retains the grant it was authorized under, and tokens are issued against the installation. Every write script asserts its required scopes at startup and exits 77 with the missing list.
+**Scope changes require reinstalling the app.** Releasing a new version updates the app's declared scopes, but an existing installation retains the grant it was authorized under. Every write script asserts its required scopes at startup and exits 77 with the missing list.
 
 ### Install
 
@@ -47,17 +48,16 @@ npx prisma migrate deploy
 
 ### Environment variables
 
-Create a `.env` file at the project root:
-
 ```
 SHOP_DOMAIN=
 SHOPIFY_CLIENT_ID=
 SHOPIFY_CLIENT_SECRET=
 DATABASE_URL=
 REDIS_URL=
+ERP_URL=http://localhost:4000
 ```
 
-`SHOP_DOMAIN` is the full `.myshopify.com` domain with no protocol. `DATABASE_URL` should end in `?sslmode=verify-full` — `require` is currently an alias for it but will adopt weaker libpq semantics in `pg` v9. `REDIS_URL` must be the `rediss://` TCP form, not Upstash's REST URL: BullMQ uses blocking commands that need a persistent socket, which HTTP cannot provide. `.env` is gitignored and must stay that way.
+`SHOP_DOMAIN` is the full `.myshopify.com` domain with no protocol. `DATABASE_URL` should end in `?sslmode=verify-full`. `REDIS_URL` must be the `rediss://` TCP form, not Upstash's REST URL: BullMQ uses blocking commands that need a persistent socket. `.env` is gitignored and must stay that way, as is `fixtures/` — captured order payloads contain real customer email addresses.
 
 ## Scripts
 
@@ -70,18 +70,20 @@ npx tsx src/export-products.ts     # full catalog via cursor pagination
 npx tsx src/bulk-export.ts         # full catalog via Bulk Operations + JSONL
 npx tsx src/sync-products.ts       # bulk export → Postgres, with change detection
 npx tsx src/db-report.ts           # read Postgres only, no Shopify calls
+npx tsx src/check-product.ts       # inspect one product's mirrored state (TITLE=)
 npx tsx src/async-patterns.ts      # concurrency benchmark, 4 strategies
 npx tsx src/inventory-report.ts    # per-location stock, quantity-name audit
 npx tsx src/metafields.ts          # definition lifecycle, mutations, idempotency proof
+npx tsx src/fetch-orders.ts        # capture real orders as webhook fixtures
 npx tsx src/generate-products.ts   # create synthetic catalog data
 npx tsx src/populate-inventory.ts  # activate inventory and set on_hand quantities
-npx tsx src/test-flow-trigger.ts   # set one variant's on_hand by SKU, printing before/after
+npx tsx src/test-flow-trigger.ts   # set one variant's on_hand by SKU
 npx tsx src/teardown-products.ts   # delete ALL generated data (requires CONFIRM=yes)
 ```
 
 ### Event layer
 
-Four processes, in separate terminals:
+Five processes, in separate terminals:
 
 ```bash
 # 1. tunnel — exposes localhost:3000 publicly
@@ -93,12 +95,20 @@ npx tsx src/webhook-server.ts
 # 3. worker — consumes the queue
 npx tsx src/worker.ts
 
-# 4. everything else
+# 4. ERP stub — stands in for a downstream system
+npx tsx src/erp-stub.ts
+
+# 5. everything else
 npx tsx src/register-webhooks.ts   # subscribe topics (needs TUNNEL_URL)
 npx tsx src/queue-monitor.ts       # queue counts and failed jobs (RETRY=yes to replay)
-npx tsx src/test-webhook.ts        # simulate a delivery locally (MODE=valid|wrong-secret|tampered|missing)
+npx tsx src/queue-clear.ts         # wipe queue state (requires CONFIRM=yes)
+npx tsx src/erp-report.ts          # ERP push status, including unknown outcomes
+npx tsx src/idempotency-report.ts  # processed events and duplicate detection
+npx tsx src/test-webhook.ts        # simulate a delivery (MODE=, FIXTURE=, TOPIC=)
 npx tsx src/test-redis.ts          # verify the Redis connection
 ```
+
+**Session startup:** the tunnel URL changes on every restart, so each session begins with restarting the tunnel and re-registering subscriptions.
 
 ### Environment overrides
 
@@ -106,16 +116,19 @@ npx tsx src/test-redis.ts          # verify the Redis connection
 LIMIT=5                            # sample mode — process N items and stop
 PAGE_SIZE=250                      # export-products.ts page size
 COUNT=2000 START_AT=21 SEED=42     # generate-products.ts
-SEED=7                             # populate-inventory.ts distribution
 SKU=AL-00500-0 TO=5                # test-flow-trigger.ts
-CONFIRM=yes                        # teardown-products.ts safety gate
+TITLE="Helmet 02000"               # check-product.ts
+CONFIRM=yes                        # destructive script safety gate
 TUNNEL_URL=https://x.trycloudflare.com   # register-webhooks.ts
-MODE=tampered                      # test-webhook.ts
+MODE=tampered FIXTURE=... TOPIC=...      # test-webhook.ts
 RETRY=yes                          # queue-monitor.ts — replay failed jobs
-FAIL_MODE=always|once|slow         # worker.ts — inject failures for testing
+IDEMPOTENT=off                     # worker.ts — disable the processed-event guard
+FAIL_AFTER_STEP=1                  # worker.ts — fail mid-transaction
+ALLOW_TEST_ORDERS=yes              # worker.ts — permit test orders to reach the ERP
+ERP_MODE=ok|fail|flaky|slow|lost   # erp-stub.ts — failure injection
 ```
 
-`LIMIT` exists because two twenty-minute runs died on mutation shapes a five-item sample would have caught in seconds. Use it whenever a write script changes.
+`LIMIT` exists because two twenty-minute runs died on mutation shapes a five-item sample would have caught in seconds.
 
 **PowerShell note:** `$env:VAR` persists for the terminal session only. A stale `PAGE_SIZE=2` turned a 6-second export into a 9-minute one more than once.
 
@@ -123,124 +136,127 @@ FAIL_MODE=always|once|slow         # worker.ts — inject failures for testing
 
 | File | Responsibility |
 |---|---|
-| `src/constants.ts` | Shared values. No imports, no side effects, safe to import anywhere |
-| `src/config.ts` | Reads and validates Shopify env vars; memoized, throws `ConfigError` |
+| `src/constants.ts` | Shared values. No imports, no side effects |
+| `src/config.ts` | Reads and validates Shopify env vars; memoized |
 | `src/errors.ts` | `ConfigError`, `ShopifyAuthError`, `ShopifyApiError` |
-| `src/retry.ts` | `withRetry` with exponential backoff and jitter; `RetryExhaustedError` |
+| `src/retry.ts` | `withRetry` with exponential backoff and jitter |
 | `src/exit.ts` | `describeError` renders any thrown value; `handleFatal` adds the exit code |
 | `src/preflight.ts` | `assertScopes` startup guard; `applyLimit` sample-mode convention |
-| `src/rate-limiter.ts` | Leaky-bucket model; gates requests, tracks cost, derives concurrency |
-| `src/shopify.ts` | Transport layer — the only file that calls `fetch` |
-| `src/mutations.ts` | Write path: `userErrors` handling, idempotency classification, `requireData` |
+| `src/rate-limiter.ts` | Leaky-bucket model; gates requests, derives concurrency |
+| `src/shopify.ts` | Transport layer — the only file that calls Shopify |
+| `src/mutations.ts` | Write path: `userErrors`, idempotency classification, `requireData` |
 | `src/paginate.ts` | Generic cursor-pagination async generators |
 | `src/bulk.ts` | Bulk Operations lifecycle: submit, poll, stream JSONL, group by parent |
-| `src/db.ts` | Prisma client singleton with driver adapter — only file importing generated code |
-| `src/queue.ts` | Redis connection and BullMQ queue definition; retry policy lives here |
-| `src/webhook-verify.ts` | HMAC verification. Pure crypto, no HTTP, testable in isolation |
-| `src/types.ts` | Zod schemas; TypeScript types derived via `z.infer` |
-| `src/webhook-server.ts` | Long-running: verifies signatures, enqueues, responds in ms |
-| `src/worker.ts` | Long-running: consumes the queue, processes jobs, handles failures |
-| `src/register-webhooks.ts` | Script: subscription management — deletes stale, creates current |
-| `src/queue-monitor.ts` | Script: queue counts, failed job inspection, replay |
-| `src/test-webhook.ts` | Script: simulates Shopify delivery, correctly or deliberately wrong |
-| `src/test-redis.ts` | Script: Redis connection diagnostic |
-| `src/check-scopes.ts` | Script: granted vs declared scopes diagnostic |
-| `src/test-flow-trigger.ts` | Script: isolates one inventory change for testing downstream reactions |
-| `src/first-query.ts` | Script: minimal query example |
-| `src/export-products.ts` | Script: paginated catalog export |
-| `src/bulk-export.ts` | Script: bulk catalog export, cross-checked against pagination |
-| `src/sync-products.ts` | Script: bulk export into Postgres with create/update/delete detection |
-| `src/db-report.ts` | Script: database state and sync run history |
-| `src/async-patterns.ts` | Script: concurrency benchmark |
-| `src/inventory-report.ts` | Script: location and inventory-level traversal |
-| `src/metafields.ts` | Script: metafield definitions and idempotent writes |
-| `src/generate-products.ts` | Script: synthetic catalog generation via atomic `productSet` |
-| `src/populate-inventory.ts` | Script: inventory activation and quantity setting |
-| `src/teardown-products.ts` | Script: tag-scoped deletion of generated data |
+| `src/db.ts` | Prisma client singleton with driver adapter |
+| `src/queue.ts` | Redis connection and BullMQ queue definition; retry policy |
+| `src/webhook-verify.ts` | HMAC verification. Pure crypto, no HTTP |
+| `src/order-handler.ts` | Order mirroring and two-phase ERP push with derived keys |
+| `src/types.ts` | Zod schemas; types derived via `z.infer` |
+| `src/webhook-server.ts` | Long-running: verifies, enqueues, responds in ms |
+| `src/worker.ts` | Long-running: consumes the queue, routes to handlers |
+| `src/erp-stub.ts` | Long-running: external system stand-in with failure injection |
+| `src/register-webhooks.ts` | Subscription management — deletes stale, creates current |
+| `src/queue-monitor.ts` | Queue counts, failed job inspection, replay |
+| `src/queue-clear.ts` | Wipes queue state; resets deduplication |
+| `src/erp-report.ts` | ERP push status including unknown outcomes |
+| `src/idempotency-report.ts` | Processed events and duplicate detection |
+| `src/fetch-orders.ts` | Captures real orders as webhook-shaped fixtures |
+| `src/test-webhook.ts` | Simulates Shopify delivery, correctly or deliberately wrong |
+| `src/test-redis.ts` | Redis connection diagnostic |
+| `src/check-scopes.ts` | Granted vs declared scopes diagnostic |
+| `src/check-product.ts` | Single product's mirrored state |
+| `src/test-flow-trigger.ts` | Isolates one inventory change |
+| Remaining `src/*.ts` | Batch scripts: export, sync, reports, generation, teardown |
 
 Dependencies flow one direction. `constants.ts`, `types.ts`, and `errors.ts` have no dependencies; scripts sit at the top.
 
 ## Database schema
 
-Three tables: `Product`, `Variant`, `SyncRun`.
+Seven tables: `Product`, `Variant`, `SyncRun`, `ProcessedEvent`, `WarehouseNotification`, `Order`, `OrderLineItem`, `ErpPush`.
 
-**Shopify GID is the primary key.** A surrogate key would cost a lookup on every upsert and buys nothing until a second store exists. Multi-store is handled by the `shopDomain` column already present, which can be promoted to a composite unique constraint `(shopDomain, gid)` later without restructuring relationships.
+**Shopify GID is the primary key.** A surrogate key would cost a lookup on every upsert and buys nothing until a second store exists. `shopDomain` is present so a composite unique constraint can be added later without restructuring relationships.
 
-**`sku` is indexed but not unique.** Shopify does not enforce SKU uniqueness, and a constraint here would reject data that legitimately exists — 23 seeded variants have no SKU at all. Constraints must match the source system's actual guarantees, not the ones you wish it had.
+**`sku` is indexed but not unique.** Shopify does not enforce SKU uniqueness — 23 seeded variants have no SKU at all. Constraints must match the source system's actual guarantees.
 
-**Soft deletes via `deletedAt`.** A hard delete discards the fact that something once existed and when it vanished. A full catalog replacement marked 2,000 rows deleted; that history would otherwise be gone.
+**Soft deletes via `deletedAt`.** A full catalog replacement marked 2,000 rows deleted; that history would otherwise be gone. Two products can share a handle across time, because Shopify frees a handle when a product is deleted — another argument for GID as primary key.
 
-**`lastSeenAt` is the deletion mechanism.** Every row touched by a run is stamped with that run's start time. Anything still holding an older timestamp was absent from the snapshot.
+**`lastSeenAt` is the deletion mechanism.** Every row touched by a run is stamped with that run's start time. Anything holding an older timestamp was absent from the snapshot.
 
-**Money is `Decimal(12,2)`, never `Float`.** Binary floating point cannot represent 0.1 exactly.
+**`OrderLineItem.variantGid` is nullable.** A variant deleted after the order was placed leaves the line item intact but unlinked.
+
+**`ErpPush` records intent before the call, outcome after.** No transaction can span Postgres and someone else's API, so a row is written as `attempting` first. A row stuck in that state means the outcome is genuinely unknown and needs reconciliation, not a blind retry.
+
+**Money is `Decimal(12,2)`, never `Float`.**
 
 ## Design notes
 
 ### Engineering
 
-**Script modules must never be imported.** A file ending in `main().catch(...)` executes on import in ESM. `teardown-products.ts` imported `GENERATED_TAG` from `generate-products.ts` and thereby launched a full 2,000-product generation on every single run — silently, interleaved with its own output. The symptom looked exactly like operator error and was misdiagnosed as such for hours. Shared values now live in `constants.ts`.
+**Script modules must never be imported.** A file ending in `main().catch(...)` executes on import in ESM. `teardown-products.ts` imported `GENERATED_TAG` from `generate-products.ts` and thereby launched a full 2,000-product generation on every single run — silently, interleaved with its own output. The symptom looked exactly like operator error and was misdiagnosed as such for hours.
 
 **When the same "user error" recurs repeatedly, it usually isn't user error.**
 
 **A negative result only means something once the boring explanations are ruled out.** Two separate wrong conclusions in this project came from a plausible story arriving before the evidence justified it.
 
-**Fail fast on missing permissions.** `assertScopes` costs one API call at startup. It replaced two failed runs — nine and twenty minutes — that were never going to succeed.
+**Fail fast on missing permissions.** `assertScopes` costs one API call at startup and replaced two failed runs — nine and twenty minutes — that were never going to succeed.
 
-**Batch database writes into single statements.** 500 individual `prisma.upsert()` calls inside one transaction is 500 sequential round trips — about 5.7 seconds against a remote database, exceeding Prisma's 5-second transaction timeout. Rewritten as one `INSERT ... ON CONFLICT DO UPDATE` per batch, the full 2,017-product catalog writes in 9 seconds. **When a timeout fires, ask why the work is slow before making the deadline longer.**
+**Batch database writes into single statements.** 500 individual `prisma.upsert()` calls inside one transaction is 500 sequential round trips, exceeding Prisma's 5-second transaction timeout. One `INSERT ... ON CONFLICT DO UPDATE` per batch writes 2,017 products in 9 seconds. **When a timeout fires, ask why the work is slow before making the deadline longer.**
 
-**Raw SQL is parameterised via `Prisma.sql` and `Prisma.join`.** Every value becomes a bound parameter. Template literals with `.join(',')` would be an injection hole, and product titles are merchant-controlled text.
-
-**Change detection compares against a snapshot loaded up front.** One `findMany` into a `Map` rather than 2,017 individual existence checks.
-
-**Sync runs are recorded, including failures.** A crash that leaves no trace makes "did it run last night" unanswerable.
+**Raw SQL is parameterised via `Prisma.sql` and `Prisma.join`.** Product titles are merchant-controlled text.
 
 **Validation at the boundary.** Every response is parsed with `safeParse` before use. There are no `as` type assertions.
 
 **Three separate error channels.** HTTP status, the GraphQL `errors` array, and mutation `userErrors`. A mutation rejected by a business rule returns HTTP 200 with no `errors` array.
 
-**Errors are checked before shape.** A rejected request frequently returns `null` data *as a consequence* of the error; validating first surfaces Zod's inference instead of the API's explanation.
+**Errors are checked before shape.** A rejected request frequently returns `null` data *as a consequence* of the error.
 
 **Error description lives in one place.** `describeError` renders any thrown value with the detail its class carries. Call sites that write their own summaries drop the useful part — this happened twice before the logic was extracted.
 
 **Retry decisions are status-based, not text-based.** Shopify's error pages contain reassuring prose like "this store will be right back" even for stores that never existed.
 
-**`Retry-After` overrides local backoff.** Backoff includes jitter so concurrent failures don't retry in lockstep.
-
-**Token caching expires early.** A 300-second safety margin avoids a token expiring in flight. A 401 mid-run invalidates the cache and retries.
-
-**`THROTTLED` arrives as HTTP 200** in the GraphQL `errors` array, so `res.ok` checks miss it entirely.
-
-**Rate limiting is adaptive, not configured.** The limiter reads `throttleStatus` from every response, extrapolates refill from elapsed time, and reserves points before admitting a request. A 20% reserve protects other processes sharing the bucket.
-
-**Retry is opt-in per operation.** Idempotency is a property of the operation, not something a wrapper can add.
-
-**Bulk writes record per-item outcomes rather than throwing.** At scale, partial success is the normal case.
-
-**JSONL parsing must handle chunk boundaries.** Network chunks do not align with newlines.
-
-**Generated code and type definitions are the most reliable documentation available.** The Prisma 7 constructor signature was resolved by reading a JSDoc example in the generated client after two wrong guesses — that file is produced by the exact installed version and cannot be stale.
+**Generated code and type definitions are the most reliable documentation available.** The Prisma 7 constructor signature was resolved by reading a JSDoc example in the generated client after two wrong guesses.
 
 ### Webhooks and queues
 
-**HMAC must be computed on the raw request body, before any parsing.** Parsing and re-serializing changes the bytes — whitespace, key order, number formatting — and the signature will not match. The failure presents as "Shopify is sending bad signatures," which sends people hunting in entirely the wrong place. The receiver reads `c.req.text()`, never `c.req.json()`.
+**HMAC must be computed on the raw request body, before any parsing.** Parsing and re-serializing changes the bytes and the signature will not match. The receiver reads `c.req.text()`, never `c.req.json()`.
 
-**Signature comparison uses `timingSafeEqual`, not `===`.** A normal string comparison exits at the first differing byte, so its duration leaks how many leading bytes were correct — enough to reconstruct a valid signature one byte at a time. Constant-time comparison removes the signal.
+**Signature comparison uses `timingSafeEqual`, not `===`.** A normal comparison exits at the first differing byte, leaking how many leading bytes were correct.
 
-**HMAC provides integrity, not just authentication.** Verified by signing a payload correctly and then altering one field in transit: the `tampered` test case sends a real signature with `total_price` changed from `750.00` to `0.01` and is rejected. Checking *who sent it* is insufficient when the request crosses networks you do not control.
+**HMAC provides integrity, not just authentication.** Verified by signing a payload correctly and then altering `total_price` from `750.00` to `0.01` in transit — rejected.
 
-**Acknowledge before processing.** Shopify's delivery timeout is a few seconds. Work done before responding risks a failed delivery, a retry, and duplicates on top of a slow handler. The receiver verifies, enqueues, and returns 200 in around 100ms; all processing happens in a separate worker process.
+**Acknowledge before processing.** The receiver verifies, enqueues, and returns 200 in around 100ms; all processing happens in a separate worker.
 
-**The webhook ID is the job ID.** `X-Shopify-Webhook-Id` is stable across redeliveries of the same event, and BullMQ refuses to add a job whose ID already exists. A redelivery is therefore silently dropped — while still returning 200, because refusing it would make Shopify retry harder.
+**The webhook ID is the job ID.** BullMQ refuses a job whose ID already exists, so a redelivery is silently dropped — while still returning 200, because refusing it would make Shopify retry harder.
 
-**Deduplication lasts only as long as job retention.** With `removeOnComplete: { age: 3600 }`, a redelivery within an hour of the original is ignored; after that the ID is gone and the work would repeat. The retention window *is* the deduplication guarantee, and it is a configuration decision rather than a property of the queue.
+**Deduplication lasts only as long as job retention.** With `removeOnComplete: { age: 3600 }`, the retention window *is* the deduplication guarantee, and it is a configuration decision rather than a property of the queue.
 
-**A crashed worker's jobs are owned by nobody.** Workers hold a lock on each job and renew it on a heartbeat; Redis cannot distinguish a dead process from a slow one. After `stalledInterval` without renewal the job is reclaimed and requeued — verified by hard-killing a worker mid-job and watching another pick it up 57 seconds later. Without this, every crash silently loses in-flight work, and nobody finds out because Shopify was acknowledged long ago.
+**A crashed worker's jobs are owned by nobody.** After `stalledInterval` without lock renewal the job is reclaimed — verified by hard-killing a worker mid-job and watching another pick it up 57 seconds later.
 
-**Stall reclaim does not count as a retry.** The reclaimed job resumed at `attempt 1`. A crash should not consume one of the handler's five attempts, because nothing actually failed.
+**Stall reclaim does not count as a retry.** The reclaimed job resumed at `attempt 1`. A crash should not consume one of the handler's five attempts.
 
-**Graceful shutdown waits for in-flight jobs.** `SIGINT` calls `worker.close()` rather than exiting immediately, so a job halfway through a database write completes instead of being abandoned. This is what makes a worker safe to restart during a deploy — and it is also why testing crash recovery requires a hard kill rather than Ctrl+C.
+**Graceful shutdown waits for in-flight jobs.** Which is also why testing crash recovery requires a hard kill rather than Ctrl+C.
 
-**Long jobs get reclaimed while still running.** A handler that exceeds the lock duration will be treated as stalled and processed concurrently by another worker. Long work needs `job.extendLock()` on a heartbeat, or a longer lock. **At-least-once is the queue's guarantee too, not only Shopify's.**
+**Long jobs get reclaimed while still running.** **At-least-once is the queue's guarantee too, not only Shopify's.**
+
+### Idempotency across a system boundary
+
+**Two guards, defending different failures.** The queue guard (`jobId`) stops duplicate jobs from Shopify redelivery and lasts one hour. The handler guard (`ProcessedEvent`) stops duplicate work from retry, stall, or lock expiry and is backed by Postgres, so it survives queue obliteration. Neither replaces the other — verified by clearing the queue entirely and replaying a webhook ID that had already been processed.
+
+**A transaction covers what shares a database.** The product handler updates the mirror, writes a warehouse notification, and records the processed event in one transaction. Injecting a failure between steps rolled back all five attempts: `step 1: updated title` logged five times, zero rows changed. The mirror went knowingly stale rather than half-applied.
+
+**Stale is a good failure; half-applied is not.** Stale is detectable by the next full sync and internally consistent. A mirror updated but a downstream system never told looks current while being wrong.
+
+**No transaction can span a database and someone else's API.** Push then record, and a crash between them means the retry pushes again. Record then push, and a crash means the push never happens. There is no ordering that fixes it.
+
+**So: record intent before, outcome after.** `ErpPush` is written as `attempting`, then updated to `confirmed`, `failed`, or `unknown`. A crash leaves evidence that a push may have happened.
+
+**`unknown` is a distinct status from `failed`, deliberately.** A timeout or connection failure means the outcome is undetermined — the remote system may have processed it and lost the response. A failure can be retried freely; an unknown needs reconciliation against the remote system.
+
+**Idempotency keys must be derived, not random.** `idempotencyKeyFor` hashes the order GID, so every attempt for the same order carries the same key. Verified against an ERP that accepted an order and then never responded: the handler timed out, retried 12 seconds later with the same key, and the ERP returned the original reference instead of creating a second order. A `randomUUID()` per attempt would have produced two shipments for one purchase.
+
+**Test orders must be blocked from reaching a live downstream system.** The bogus gateway marks every development order `test: true`. Pushing one to an ERP creates a shipment nobody ordered, so the handler refuses unless explicitly overridden.
+
+**Set a timeout on outbound calls.** Without `AbortSignal.timeout`, a hung downstream system hangs the worker until the job stalls — converting a slow dependency into a queue outage.
 
 ### Shopify data model
 
@@ -248,55 +264,45 @@ Findings verified against a live development store, not taken from documentation
 
 **Inventory does not live on a variant.** The chain is `ProductVariant → InventoryItem → InventoryLevel → Location`.
 
-**Setting `tracked: true` does not create inventory levels.** An item must be activated at a location via `inventoryActivate` before any quantity can be set there.
+**Setting `tracked: true` does not create inventory levels.** An item must be activated at a location via `inventoryActivate` first.
 
-**Untracked variants are not zero-stock variants.** No levels at all. Treating it as `0` would overwrite a downstream system with a number meaning "none" when the truth is "unknown."
+**Untracked variants are not zero-stock variants.** Treating it as `0` would overwrite a downstream system with a number meaning "none" when the truth is "unknown."
 
 **Quantity names are not interchangeable.** Verified with an unfulfilled test order: one unit moved from `available` while `on_hand` stayed constant and `committed` rose to 1.
 
 **`on_hand` is settable; `available` is derived** as `on_hand − committed`.
 
-**`totalInventory` reflects `available`, not `on_hand`.**
-
 **Location capability is a filter, not metadata.** 38,312 of 234,204 units sit at a `shipsInventory: false` location — 16% of stock, real but unfulfillable online.
 
-**Deactivated locations still hold stock.** `locations` omits them unless `includeInactive: true`.
+**Financial and fulfillment status are independent.** An order can be paid and unfulfilled, or fulfilled and refunded. Treating fulfillment as a function of payment is a common and expensive mistake.
 
 **Shopify does not enforce SKU uniqueness.** Handles are auto-deduplicated; SKUs are not.
 
-**`userError` payload types differ per mutation.** `productCreate` and `productDelete` return plain `UserError`; `productSet` and `metafieldsSet` carry `code`; `inventoryActivate` has **no** `userErrors` field. Requesting a field that doesn't exist fails at query *validation*.
+**`userError` payload types differ per mutation.** `inventoryActivate` has **no** `userErrors` field. Requesting a field that doesn't exist fails at query *validation*.
 
-**Inventory mutations require an explicit `@idempotent` directive.** Both `inventoryActivate` and `inventorySetQuantities` reject requests without `@idempotent(key: $key)`. Shopify enforces at the protocol level the same distinction this project classifies by hand.
+**Inventory mutations require an explicit `@idempotent` directive.** Shopify enforces at the protocol level the same distinction this project classifies by hand.
 
-**`ignoreCompareQuantity` was removed in 2026-04.** Compare-and-swap moved to a per-quantity `changeFromQuantity`; `null` explicitly opts out, and the field must always be present.
+**`ignoreCompareQuantity` was removed in 2026-04.** Compare-and-swap moved to a per-quantity `changeFromQuantity`.
 
 **Two sequential mutations have no transaction.** `productSet` with `synchronous: true` is atomic where `productCreate` + `productVariantsBulkCreate` is not.
 
-**Bulk queries use a different dialect.** `edges { node { } }` required; nested connections take no `first:` and return everything.
+**Bulk queries use a different dialect.** `edges { node { } }` required; nested connections take no `first:`.
 
-**`objectCount` counts JSONL lines, not records.**
+**Metafield definitions require namespace ownership.** The `$app:` prefix reserves one; app-namespaced metafields are invisible in the admin.
 
-**Metafield definitions require namespace ownership.** The `$app:` prefix reserves one. App-namespaced metafields are invisible in the admin — correct for machine state, wrong for merchant-managed data.
+**Granted scopes and declared scopes drift.** `currentAppInstallation.accessScopes` is ground truth.
 
-**`metafieldsSet` is an upsert**, matching on `ownerId` + `namespace` + `key`.
+**Deletion produces no event.** Full-snapshot sync plus `lastSeenAt` is the only way to answer "what is no longer here."
 
-**Granted scopes and declared scopes drift.** Reads worked normally while every mutation was denied. `currentAppInstallation.accessScopes` is ground truth.
+**Protected customer data gates the Order object itself, not just webhook subscriptions.** With `read_orders` granted and the scope preflight passing, `orders(first: 10)` was rejected with "not approved to access the Order object." The gate sits above OAuth scopes. **Selecting a data use under App setup → Protected customer data access unlocks it immediately for development** — no App Store review, and the Draft status and data protection questionnaire only gate distribution. Worth knowing before quoting a client on an order integration: the answer is "five minutes," not "pending review."
 
-**Deletion produces no event.** A product removed from Shopify simply stops appearing in exports. An incremental sync filtering on `updatedAt` can never detect it. Full-snapshot sync plus `lastSeenAt` is the only way to answer "what is no longer here."
+**`products/update` fires on inventory changes.** The topic covers the product as an aggregate, so a store syncing inventory generates high volume on a topic whose name suggests otherwise.
 
-**Webhook subscription is gated separately from API scope.** `ORDERS_CREATE` is rejected with "not approved to subscribe to webhook topics containing protected customer data" even with `read_orders` granted. Reading orders via the API and receiving order webhooks are different permissions with different approval processes.
-
-**`products/update` fires on inventory changes.** The topic covers the product as an aggregate — variants and their stock included — so a store syncing inventory generates high volume on a topic whose name suggests otherwise. Most of those payloads contain nothing a product mirror cares about, which is why the handler compares against stored values before writing.
-
-**Quick tunnels are ephemeral.** `cloudflared`'s account-less tunnels have no uptime guarantee, expire on idle, and issue a new URL on every restart. Each session therefore requires restarting the tunnel and re-registering subscriptions; `register-webhooks.ts` deletes before creating, because otherwise subscriptions accumulate pointing at dead endpoints and Shopify retries deliveries into the void.
+**Quick tunnels are ephemeral.** New URL on every restart, expiry on idle. `register-webhooks.ts` deletes before creating, because otherwise subscriptions accumulate pointing at dead endpoints.
 
 ### Shopify Flow
 
-**Flow triggers fire identically for admin edits and API writes.** Verified on both `Product created` (via `productSet`) and `Product variant inventory quantity changed` (via `inventorySetQuantities`). There is no admin-only behaviour.
-
-An earlier conclusion that inventory triggers ignored API changes was wrong, and the reasoning behind the error is worth keeping. A batch of ~60 API inventory writes produced zero workflow runs while a manual admin edit fired immediately — which looked like clear evidence of an API blind spot. The real cause was that the workflow used an edge-triggered condition, `inventoryQuantityPrior >= 10 AND inventoryQuantity < 10`, and no write in that randomly-distributed sample crossed the threshold from above. **Zero runs was correct behaviour, not a missing trigger.**
-
-Confirmed by isolating a single write: one variant taken from 21 to 5 fired the workflow immediately. `test-flow-trigger.ts` exists to make that kind of isolation cheap, printing the before-state alongside the change so a non-result cannot be mistaken for a failure.
+**Flow triggers fire identically for admin edits and API writes.** An earlier conclusion that inventory triggers ignored API changes was wrong: the workflow used an edge-triggered condition and no write in the random sample crossed the threshold from above. **Zero runs was correct behaviour, not a missing trigger.** Confirmed by isolating a single 21→5 write, which fired immediately.
 
 **Edge-triggered conditions are the right pattern for threshold alerts.** Checking only `quantity < 10` fires on every subsequent change while the item stays low; adding the prior-value check fires once, on the transition.
 
@@ -304,13 +310,13 @@ Confirmed by isolating a single write: one variant taken from 21 to 5 fired the 
 
 ### Prisma 7 specifics
 
-**The client no longer bundles a database driver.** `new PrismaClient()` requires a driver adapter — `new PrismaClient({ adapter: new PrismaPg({ connectionString }) })`. `datasourceUrl` and `datasources` no longer exist.
+**The client no longer bundles a database driver.** `new PrismaClient({ adapter: new PrismaPg({ connectionString }) })`. `datasourceUrl` and `datasources` no longer exist.
 
 **`prisma.config.ts` configures the CLI only.** The runtime connection is established in application code.
 
-**The generated client is TypeScript source at a configured `output` path.** It is gitignored and rebuilt by `prisma generate`; `prisma/migrations/` is committed.
+**The generated client is TypeScript source at a configured `output` path.** Gitignored and rebuilt by `prisma generate`; `prisma/migrations/` is committed.
 
-**`migrate dev` does not always emit the client.** Run `prisma generate` explicitly.
+**ioredis needs a named import.** `import { Redis } from 'ioredis'` — the default export is the module namespace and is not constructable.
 
 ## Measured behaviour
 
@@ -325,30 +331,33 @@ Plus development store: 20,000-point bucket, 1000/sec restore. Catalog of 2,017 
 | 4,053 products deleted | 2m 38s, 0 failures |
 | Full read, `PAGE_SIZE=250` | 9 pages, 6.2s |
 | Full read, Bulk Operations | 6.2s + 2.2s parse, bucket stayed at 20,000 |
-| Full sync to Postgres, initial load | 2,017 created + 6,040 variants in 9.0s |
+| Full sync, initial load | 2,017 created + 6,040 variants in 9.0s |
 | Full sync, no changes | 2,017 unchanged in 12.3s |
-| Full sync, complete catalog replacement | 2,000 created, 17 unchanged, 1,999 + 6,012 deleted in 10.7s |
-| Query cost | 7–51 points depending on depth |
+| Full sync, complete catalog replacement | 2,000 created, 1,999 + 6,012 deleted in 10.7s |
+| Full sync catching webhook drift | 10 updated, detected without knowing why |
 
 **Four independent implementations agree exactly** on 2,017 products: paginated export, bulk export, inventory report, and the Postgres mirror.
 
-**The rate limiter has never triggered.** The bucket never dropped below 19,800 in any run. On a Basic-plan store (100 points, 50/sec) the same workload would throttle within the first two products.
+**The rate limiter has never triggered.** The bucket never dropped below 19,800 in any run.
 
 ### Event layer
 
 | Path | Result |
 |---|---|
 | Receipt → verified → enqueued | 68–250ms |
-| Enqueue → worker pickup | 170–420ms |
+| Enqueue → worker pickup | 170–510ms |
 | Valid signature | 200, job queued |
 | Wrong secret / tampered body / missing header | 401, nothing queued |
 | Redelivery with same webhook ID | 200 returned, job silently dropped |
+| Same webhook ID after queue obliteration | handler guard caught it, no work done |
 | Exponential backoff across 5 attempts | 160ms → 2.5s → 6.9s → 15.1s → 31.4s, then `[DEAD]` |
-| Transient failure (`FAIL_MODE=once`) | recovered on attempt 2, ~2.4s later |
-| Dead-letter replay | job resumed after 178s in the failed set, across a worker restart |
+| Transient failure | recovered on attempt 2, ~2.4s later |
+| Dead-letter replay | resumed after 178s in the failed set, across a worker restart |
 | Hard-killed worker mid-job | stall detected, requeued, completed 57s after receipt at `attempt 1` |
+| Failure mid-transaction, 5 attempts | 5 partial executions, 0 rows changed |
+| ERP accepted then lost the response | timed out, retried with same derived key, ERP returned original reference — one order, not two |
 
-**Every failure path has been exercised**, not assumed: retry recovery, backoff escalation, dead-lettering, replay, and stalled-job reclaim.
+**Every failure path has been exercised**, not assumed.
 
 ## Exit codes
 
@@ -364,58 +373,57 @@ Plus development store: 20,000-point bucket, 1000/sec restore. Catalog of 2,017 
 
 ## Known limitations
 
-1. **Handlers are not explicitly idempotent.** Queue-level deduplication stops duplicate *jobs*, but a job that fails partway and retries still repeats whatever it already did. The current handler happens to be safe because a primary-key update is naturally idempotent; a multi-step handler would not be. No processed-event table exists.
+1. **No reconciliation against the ERP.** `ErpPush` records what this system believes it sent, but nothing compares that against what the ERP actually holds. Observed directly: restarting the stub cleared its memory, leaving a `confirmed` push for an order the ERP had no record of. A reconciliation job querying both sides would catch it; the same gap exists for any `unknown` push.
 
-2. **Concurrency ceiling is arbitrary.** Capped at 20; the uncapped figure on this store is around 60.
+2. **`populate-inventory.ts` still uses random idempotency keys.** `randomUUID()` per call means a retry sends a different key to Shopify's `@idempotent` directive, so server-side deduplication never engages. The correct derived-key pattern is implemented in `order-handler.ts` but has not been applied back.
 
-3. **The rate limiter is untested under real pressure.** The waiting path has never executed against a genuine limit, only a stubbed 429.
+3. **The ERP stub has no persistence.** In-memory state resets on restart, which is realistic for a stub but means it cannot demonstrate long-lived deduplication.
 
-4. **Idempotency keys are random per call, not derived.** `randomUUID()` means a retried request sends a *different* key, so Shopify's server-side deduplication never actually engages.
+4. **Concurrency ceiling is arbitrary.** Capped at 20; the uncapped figure on this store is around 60.
 
-5. **Single store per process.** `getConfig()` memoizes into module scope and `shopify.ts` exports one shared limiter.
+5. **The rate limiter is untested under real pressure.** The waiting path has never executed against a genuine limit, only a stubbed 429.
 
-6. **Sync is full-snapshot only.** Correct, and the only way to detect deletions, but a 500,000-product store would want incremental updates with periodic full reconciliation.
+6. **Single store per process.** `getConfig()` memoizes into module scope and `shopify.ts` exports one shared limiter.
 
-7. **Inventory levels are not persisted.** The database cannot answer the fulfillability question `inventory-report.ts` can.
+7. **Sync is full-snapshot only.** Correct, and the only way to detect deletions, but a 500,000-product store would want incremental updates with periodic full reconciliation.
 
-8. **Only one webhook topic is subscribed.** `products/update` alone. Order topics require protected customer data approval.
+8. **Inventory levels are not persisted.** The database cannot answer the fulfillability question `inventory-report.ts` can.
 
-9. **The receiver has no rate limiting or body size cap.** A public endpoint accepting arbitrary POST bodies with no upper bound is a denial-of-service surface, even though invalid signatures are rejected.
+9. **Only one webhook topic is subscribed live.** `products/update`. Order events are driven from captured fixtures rather than real deliveries.
 
-10. **Failed jobs are not alerted on.** The dead-letter queue must be inspected manually via `queue-monitor.ts`. Nothing notifies anyone that a job died.
+10. **The receiver has no rate limiting or body size cap.** A public endpoint accepting arbitrary POST bodies with no upper bound is a denial-of-service surface, even though invalid signatures are rejected.
 
-11. **Teardown cannot distinguish test data from real data.** Every generated product carries the same tag, so removing three sample products removes all two thousand.
+11. **Failed jobs are not alerted on.** The dead-letter queue must be inspected manually.
 
-12. **Teardown has a check-then-act race.** Anything created between `collectIds()` and the delete loop survives while the script reports success.
+12. **Teardown cannot distinguish test data from real data**, and has a check-then-act race.
 
-13. **Nested connection depth is fixed outside bulk queries.**
+13. **Bulk error paths are untested.** `FAILED`, `EXPIRED`, `partialDataUrl`, and timeout handling have never executed.
 
-14. **Bulk error paths are untested.** `FAILED`, `EXPIRED`, `partialDataUrl`, and timeout handling have never executed.
-
-15. **No automated tests.** Everything has been verified manually — broken credentials, unresolvable hosts, stubbed 429s, committed stock, catalog replacement, a fake required scope, four webhook signature modes, and injected worker failures — but none of it is repeatable without a human.
+14. **No automated tests.** Everything has been verified manually — broken credentials, unresolvable hosts, stubbed 429s, committed stock, catalog replacement, a fake required scope, four webhook signature modes, injected worker failures, mid-transaction failure, and a lost ERP response — but none of it is repeatable without a human.
 
 ## Resolved
 
 - ~~No token invalidation on 401~~ — a rejected token now clears the cache and retries.
 - ~~Concurrency limit is hardcoded~~ — derived from observed cost and restore rate.
 - ~~Throttle reporting understates pressure~~ — limiter extrapolates rather than trusting the last reading.
-- ~~`totalInventory` audit passed vacuously~~ — retested with committed stock present.
 - ~~`retry.ts` is unsafe for mutations~~ — retry is opt-in per operation.
-- ~~Read-only~~ — write path implemented with `userErrors` handling and proven idempotency.
+- ~~Read-only~~ — write path with `userErrors` handling and proven idempotency.
 - ~~Catalog too small to test at scale~~ — 2,017 products, 6,040 variants.
 - ~~No bulk export~~ — JSONL streaming, verified against pagination.
 - ~~Generated products have no inventory~~ — 234,274 units across two locations.
 - ~~Scripts appear to interfere when run concurrently~~ — root cause was a module side-effect import.
 - ~~No persistence~~ — Postgres mirror with create, update, and delete detection.
-- ~~No scope preflight~~ — every write script asserts required scopes and exits 77 in about two seconds.
-- ~~No dry-run or sample mode~~ — shared `LIMIT` convention across write scripts.
-- ~~Flow inventory triggers appear blind to API writes~~ — false; the edge-triggered condition simply wasn't satisfied by the test data.
-- ~~No real-time events~~ — webhook receiver with HMAC verification, durable queue, and every failure path tested.
+- ~~No scope preflight~~ — every write script asserts scopes and exits 77 in about two seconds.
+- ~~No dry-run or sample mode~~ — shared `LIMIT` convention.
+- ~~Flow inventory triggers appear blind to API writes~~ — false; the edge-triggered condition wasn't satisfied by the test data.
+- ~~No real-time events~~ — webhook receiver with HMAC verification, durable queue, every failure path tested.
+- ~~Handlers are not explicitly idempotent~~ — `ProcessedEvent` guard plus transactional multi-step writes.
+- ~~Order data inaccessible~~ — protected customer data unlocked for development; five real orders captured as fixtures.
 
 ## Roadmap
 
-- Idempotent handlers with a processed-event table
-- Order → ERP middleware as an integration project
+- Reconciliation job comparing `ErpPush` against the ERP's actual contents
+- Apply derived idempotency keys to `populate-inventory.ts`
 - Persist inventory levels per location
 - Alerting on dead-lettered jobs
 - Incremental sync with periodic full reconciliation
