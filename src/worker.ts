@@ -17,11 +17,14 @@ const ProductPayloadSchema = z.looseObject({
 });
 
 async function handleProductUpdate(job: Job<WebhookJob>): Promise<void> {
-    /**
-   * Deliberate failure injection for testing retry and dead-letter paths.
-   * FAIL_MODE=always  — throw every time, exhausts retries
-   * FAIL_MODE=once    — throw on attempt 1 only, proves recovery
-   * FAIL_MODE=slow    — take 30s, so the worker can be killed mid-job
+  /**
+   * Deliberate failure injection for exercising failure paths. Remove before
+   * this goes anywhere real — test scaffolding left in production code is its
+   * own category of bug.
+   *
+   * FAIL_MODE=always — throw every time, exhausts retries into the dead set
+   * FAIL_MODE=once   — throw on attempt 1 only, proves backoff recovery
+   * FAIL_MODE=slow   — sleep 30s, so the worker can be killed mid-job
    */
   const failMode = process.env['FAIL_MODE'];
 
@@ -36,7 +39,9 @@ async function handleProductUpdate(job: Job<WebhookJob>): Promise<void> {
   if (failMode === 'slow') {
     console.log('  sleeping 30s — kill the worker now to test job recovery');
     await new Promise((r) => setTimeout(r, 30_000));
+    console.log('  woke up, continuing');
   }
+
   const parsed = ProductPayloadSchema.safeParse(JSON.parse(job.data.payload));
 
   if (!parsed.success) {
@@ -109,11 +114,33 @@ const worker = new Worker<WebhookJob>(
     connection,
     /** Process up to 5 jobs at once. */
     concurrency: 5,
+
+    /**
+     * A worker holds a lock on each job it processes and renews it on a
+     * heartbeat. If the process dies, renewal stops and the job is left
+     * "active" but owned by nobody — Redis cannot tell the difference between
+     * a crashed worker and a slow one.
+     *
+     * After `stalledInterval` with no renewal, the job is reclaimed and
+     * requeued. Without this, every crash silently loses whatever was in
+     * flight, and nobody finds out because Shopify was acknowledged long ago.
+     *
+     * The tradeoff: a job that legitimately takes longer than the lock
+     * duration will be reclaimed while still running, and processed twice.
+     * Long-running work needs either a longer lock or periodic
+     * `job.extendLock()`.
+     */
+    stalledInterval: 30_000,
+    maxStalledCount: 2,
   }
 );
 
 worker.on('completed', (job) => {
   console.log(`[done] ${job.id}\n`);
+});
+
+worker.on('stalled', (jobId) => {
+  console.warn(`[stalled] ${jobId} — lock expired, requeued for another worker\n`);
 });
 
 worker.on('failed', (job, err) => {
