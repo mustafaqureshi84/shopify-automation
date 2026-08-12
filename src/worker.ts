@@ -17,6 +17,26 @@ const ProductPayloadSchema = z.looseObject({
 });
 
 async function handleProductUpdate(job: Job<WebhookJob>): Promise<void> {
+    /**
+   * Deliberate failure injection for testing retry and dead-letter paths.
+   * FAIL_MODE=always  — throw every time, exhausts retries
+   * FAIL_MODE=once    — throw on attempt 1 only, proves recovery
+   * FAIL_MODE=slow    — take 30s, so the worker can be killed mid-job
+   */
+  const failMode = process.env['FAIL_MODE'];
+
+  if (failMode === 'always') {
+    throw new Error('Injected failure (FAIL_MODE=always)');
+  }
+
+  if (failMode === 'once' && job.attemptsMade === 0) {
+    throw new Error('Injected failure (FAIL_MODE=once, attempt 1)');
+  }
+
+  if (failMode === 'slow') {
+    console.log('  sleeping 30s — kill the worker now to test job recovery');
+    await new Promise((r) => setTimeout(r, 30_000));
+  }
   const parsed = ProductPayloadSchema.safeParse(JSON.parse(job.data.payload));
 
   if (!parsed.success) {
