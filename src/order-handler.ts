@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto';
 import { prisma } from './db.js';
+import { idempotencyKey } from './constants.js';
 import { z } from 'zod';
 
 const ERP_URL = process.env['ERP_URL'] ?? 'http://localhost:4000';
@@ -30,21 +30,6 @@ const OrderPayloadSchema = z.looseObject({
 
 export type OrderPayload = z.infer<typeof OrderPayloadSchema>;
 
-/**
- * Derived from the order GID, NOT random.
- *
- * A random key on every attempt defeats the entire purpose — the ERP would
- * see each retry as a new order. Deriving it means every attempt for the same
- * order carries the same key, so the ERP can recognise the repeat.
- *
- * This is the flaw already documented in this project's own inventory code,
- * where `randomUUID()` is passed to Shopify's `@idempotent` directive and the
- * deduplication therefore never engages.
- */
-export function idempotencyKeyFor(orderGid: string): string {
-  return createHash('sha256').update(orderGid).digest('hex').slice(0, 32);
-}
-
 interface ErpResponse {
   reference: string;
   duplicate: boolean;
@@ -72,7 +57,8 @@ async function pushToErp(
         quantity: item.quantity,
       })),
     }),
-    // Without a timeout, a hung ERP hangs the worker until the job stalls.
+    // Without a timeout, a hung ERP hangs the worker until the job stalls,
+    // turning a slow dependency into a queue outage.
     signal: AbortSignal.timeout(5000),
   });
 
@@ -157,12 +143,12 @@ export async function handleOrderCreate(
     return `mirrored ${order.name} (test order, ERP skipped)`;
   }
 
-  const key = idempotencyKeyFor(gid);
+  const key = idempotencyKey('erp-order', gid);
 
   /**
-   * If a previous attempt confirmed, stop. This is separate from the
-   * ProcessedEvent guard: that one is keyed on the webhook, this one on the
-   * order — so a *different* webhook for the same order also won't double-push.
+   * Separate from the ProcessedEvent guard: that one is keyed on the webhook,
+   * this one on the order — so a *different* webhook for the same order also
+   * won't double-push.
    */
   const priorConfirmed = await prisma.erpPush.findFirst({
     where: { orderGid: gid, status: 'confirmed' },

@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { mutate, requireData } from './mutations.js';
 import { limiter } from './shopify.js';
 import { paginate } from './paginate.js';
@@ -12,7 +11,7 @@ import {
 import type { Location, InventoryItemRef } from './types.js';
 import type { Connection } from './paginate.js';
 import { handleFatal, describeError } from './exit.js';
-import { GENERATED_TAG } from './constants.js';
+import { GENERATED_TAG, idempotencyKey } from './constants.js';
 
 const REQUIRED_SCOPES = [
   'read_products',
@@ -81,8 +80,7 @@ const ACTIVATE = `
  *
  * Each quantity carries `changeFromQuantity` for compare-and-swap. The
  * mutation-level `ignoreCompareQuantity` flag was removed in 2026-04;
- * passing `null` per quantity is now the explicit opt-out, and the field
- * must always be present.
+ * passing `null` per quantity is now the explicit opt-out.
  */
 const SET_QUANTITIES = `
   mutation SetQuantities(
@@ -174,7 +172,17 @@ async function applyPlan(plan: Plan): Promise<{ ok: boolean; error?: string }> {
         variables: {
           inventoryItemId: plan.inventoryItemId,
           locationId,
-          idempotencyKey: randomUUID(),
+          /**
+           * Derived from item + location, so every retry of this operation
+           * carries the same key and Shopify can recognise the replay.
+           * A randomUUID() here would make each attempt look like a new
+           * request, defeating the directive entirely.
+           */
+          idempotencyKey: idempotencyKey(
+            'activate',
+            plan.inventoryItemId,
+            locationId
+          ),
         },
       });
 
@@ -190,7 +198,15 @@ async function applyPlan(plan: Plan): Promise<{ ok: boolean; error?: string }> {
       // Absolute values, not deltas — replaying is safe.
       idempotency: 'idempotent',
       variables: {
-        idempotencyKey: randomUUID(),
+        /**
+         * Keyed on the item and the set of locations being written. Sorted
+         * so the key doesn't change with Map iteration order.
+         */
+        idempotencyKey: idempotencyKey(
+          'set-quantities',
+          plan.inventoryItemId,
+          [...plan.quantities.keys()].sort().join(',')
+        ),
         input: {
           name: 'on_hand',
           reason: 'other',
@@ -199,8 +215,7 @@ async function applyPlan(plan: Plan): Promise<{ ok: boolean; error?: string }> {
             locationId,
             quantity,
             // Explicit null opts out of compare-and-swap. Correct here —
-            // we're setting initial values with no prior state to compare
-            // against. A real sync would pass the last-known quantity.
+            // setting initial values with no prior state to compare against.
             changeFromQuantity: null,
           })),
         },
