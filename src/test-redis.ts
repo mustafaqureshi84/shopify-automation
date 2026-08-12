@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import IORedis from 'ioredis';
+import { Redis } from 'ioredis';
 import { ConfigError } from './errors.js';
 import { handleFatal } from './exit.js';
 
@@ -10,7 +10,7 @@ if (!url) {
 }
 
 async function main(): Promise<void> {
-  const redis = new IORedis(url!, { maxRetriesPerRequest: null });
+  const redis = new Redis(url!, { maxRetriesPerRequest: null });
 
   await redis.set('automation-lab:ping', 'pong');
   const value = await redis.get('automation-lab:ping');

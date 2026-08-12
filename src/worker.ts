@@ -16,30 +16,33 @@ const ProductPayloadSchema = z.looseObject({
   updated_at: z.string().optional(),
 });
 
+/**
+ * IDEMPOTENT=off disables the processed-event guard, so the cost of not
+ * having one can be observed rather than described.
+ */
+const GUARD_ENABLED = process.env['IDEMPOTENT'] !== 'off';
+
+/**
+ * FAIL_AFTER_STEP=1 throws after the product update but before the
+ * warehouse notification — the partial-completion case that makes
+ * multi-step handlers dangerous.
+ */
+const FAIL_AFTER_STEP = process.env['FAIL_AFTER_STEP'];
+
 async function handleProductUpdate(job: Job<WebhookJob>): Promise<void> {
-  /**
-   * Deliberate failure injection for exercising failure paths. Remove before
-   * this goes anywhere real — test scaffolding left in production code is its
-   * own category of bug.
-   *
-   * FAIL_MODE=always — throw every time, exhausts retries into the dead set
-   * FAIL_MODE=once   — throw on attempt 1 only, proves backoff recovery
-   * FAIL_MODE=slow   — sleep 30s, so the worker can be killed mid-job
-   */
-  const failMode = process.env['FAIL_MODE'];
+  const { webhookId, topic, shop } = job.data;
 
-  if (failMode === 'always') {
-    throw new Error('Injected failure (FAIL_MODE=always)');
-  }
+  if (GUARD_ENABLED) {
+    const already = await prisma.processedEvent.findUnique({
+      where: { webhookId },
+    });
 
-  if (failMode === 'once' && job.attemptsMade === 0) {
-    throw new Error('Injected failure (FAIL_MODE=once, attempt 1)');
-  }
-
-  if (failMode === 'slow') {
-    console.log('  sleeping 30s — kill the worker now to test job recovery');
-    await new Promise((r) => setTimeout(r, 30_000));
-    console.log('  woke up, continuing');
+    if (already) {
+      console.log(
+        `  already processed at ${already.processedAt.toISOString()} — skipping`
+      );
+      return;
+    }
   }
 
   const parsed = ProductPayloadSchema.safeParse(JSON.parse(job.data.payload));
@@ -72,26 +75,70 @@ async function handleProductUpdate(job: Job<WebhookJob>): Promise<void> {
 
   if (changes.length === 0) {
     console.log(`  ${product.title} — no tracked fields changed`);
+
+    // Still record it. A no-op is a completed outcome, and without the row
+    // a redelivery would repeat the comparison work.
+    if (GUARD_ENABLED) {
+      await prisma.processedEvent.create({
+        data: { webhookId, topic, shopDomain: shop, summary: 'no changes' },
+      });
+    }
     return;
   }
 
   /**
-   * An update keyed on the primary key is naturally idempotent: applying the
-   * same values twice leaves the same row. That is what makes retrying this
-   * job safe.
+   * Both writes plus the processed-event row happen in one transaction.
+   * A crash anywhere inside leaves the database exactly as it was, so the
+   * retry starts clean rather than half-applied.
+   *
+   * This only works because every step is in the same database. A real
+   * warehouse call would be HTTP, which no transaction can cover — see the
+   * note on WarehouseNotification in schema.prisma.
    */
-  await prisma.product.update({
-    where: { gid },
-    data: {
-      title: product.title,
-      handle: product.handle,
-      status: product.status.toUpperCase(),
-      lastSeenAt: new Date(),
-      deletedAt: null,
-    },
+  await prisma.$transaction(async (tx) => {
+    // Step 1 — update the mirror.
+    await tx.product.update({
+      where: { gid },
+      data: {
+        title: product.title,
+        handle: product.handle,
+        status: product.status.toUpperCase(),
+        lastSeenAt: new Date(),
+        deletedAt: null,
+      },
+    });
+
+    console.log(`  step 1: updated ${changes.join(', ')}`);
+
+    if (FAIL_AFTER_STEP === '1') {
+      throw new Error('Injected failure after step 1 (FAIL_AFTER_STEP=1)');
+    }
+
+    // Step 2 — notify the "warehouse". This is the non-idempotent one:
+    // every call creates a new row.
+    await tx.warehouseNotification.create({
+      data: {
+        productGid: gid,
+        title: product.title,
+        reason: `changed: ${changes.join(', ')}`,
+      },
+    });
+
+    console.log(`  step 2: warehouse notified`);
+
+    if (GUARD_ENABLED) {
+      await tx.processedEvent.create({
+        data: {
+          webhookId,
+          topic,
+          shopDomain: shop,
+          summary: `updated ${changes.join(', ')}`,
+        },
+      });
+    }
   });
 
-  console.log(`  ${product.title} — updated: ${changes.join(', ')}`);
+  console.log(`  ${product.title} — complete`);
 }
 
 const worker = new Worker<WebhookJob>(
@@ -112,23 +159,16 @@ const worker = new Worker<WebhookJob>(
   },
   {
     connection,
-    /** Process up to 5 jobs at once. */
     concurrency: 5,
 
     /**
-     * A worker holds a lock on each job it processes and renews it on a
-     * heartbeat. If the process dies, renewal stops and the job is left
-     * "active" but owned by nobody — Redis cannot tell the difference between
-     * a crashed worker and a slow one.
+     * A worker holds a lock on each job and renews it on a heartbeat. If the
+     * process dies, renewal stops and the job is left "active" but owned by
+     * nobody. After `stalledInterval` without renewal it is reclaimed.
      *
-     * After `stalledInterval` with no renewal, the job is reclaimed and
-     * requeued. Without this, every crash silently loses whatever was in
-     * flight, and nobody finds out because Shopify was acknowledged long ago.
-     *
-     * The tradeoff: a job that legitimately takes longer than the lock
-     * duration will be reclaimed while still running, and processed twice.
-     * Long-running work needs either a longer lock or periodic
-     * `job.extendLock()`.
+     * The tradeoff: a job legitimately taking longer than the lock will be
+     * reclaimed while still running, and processed twice. Long work needs
+     * `job.extendLock()` or a longer lock.
      */
     stalledInterval: 30_000,
     maxStalledCount: 2,
@@ -158,11 +198,12 @@ worker.on('failed', (job, err) => {
   }
 });
 
-console.log('Worker started, waiting for jobs...\n');
+console.log(
+  `Worker started — idempotency guard ${GUARD_ENABLED ? 'ON' : 'OFF'}\n`
+);
 
 async function shutdown(): Promise<void> {
   console.log('\nShutting down...');
-  // Waits for in-flight jobs to finish rather than abandoning them mid-write.
   await worker.close();
   await prisma.$disconnect();
   process.exit(0);

@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import IORedis from 'ioredis';
+import { Redis } from 'ioredis';
 import { Queue } from 'bullmq';
 import { ConfigError } from './errors.js';
 
@@ -13,11 +13,15 @@ if (!url) {
 }
 
 /**
+ * Named import, not default. ioredis is CommonJS; its default export is the
+ * module namespace object, which is not constructable. The class is the
+ * named `Redis` export.
+ *
  * BullMQ requires `maxRetriesPerRequest: null`. Its workers use blocking
  * commands that wait for a job to appear, and ioredis's default retry
  * behaviour would abort those as timeouts.
  */
-export const connection = new IORedis(url, {
+export const connection = new Redis(url, {
   maxRetriesPerRequest: null,
   enableReadyCheck: false,
 });
@@ -49,6 +53,9 @@ export const webhookQueue = new Queue<WebhookJob>(WEBHOOK_QUEUE, {
     /**
      * Keep completed jobs briefly for observability, failed ones for much
      * longer — a failure nobody can inspect is a failure nobody can fix.
+     *
+     * Note this retention window IS the deduplication guarantee: a job ID
+     * only blocks a duplicate for as long as the job is retained.
      */
     removeOnComplete: { age: 3600, count: 1000 },
     removeOnFail: { age: 7 * 24 * 3600 },
