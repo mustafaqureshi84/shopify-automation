@@ -5,7 +5,7 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "tsx --test src/**/*.test.ts",
     "tunnel": "\"C:\\Program Files (x86)\\cloudflared\\cloudflared.exe\" tunnel --url http://localhost:3000",
     "webhooks": "tsx src/webhook-server.ts"
   },
@@ -14,7 +14,7 @@
   "license": "ISC",
   "devDependencies": {
     "@shopify/cli": "^4.6.1",
-    "@types/node": "^26.1.2",
+    "@types/node": "^26.2.0",
     "@types/pg": "^8.21.0",
     "localtunnel": "^2.0.2",
     "prisma": "^7.9.1",
