@@ -74,6 +74,10 @@ model SyncRun {
 }
 
 /// Records which webhook events have been fully processed.
+///
+/// Queue-level deduplication stops duplicate *jobs*. This stops duplicate
+/// *work* when a single job is retried after a partial failure, reclaimed
+/// from a crashed worker, or run concurrently after a lock expires.
 model ProcessedEvent {
   webhookId   String   @id
   topic       String
@@ -103,8 +107,8 @@ model Order {
 
   /// Shopify's financial and fulfillment states are independent — an order
   /// can be paid and unfulfilled, or fulfilled and refunded.
-  financialStatus    String?
-  fulfillmentStatus  String?
+  financialStatus   String?
+  fulfillmentStatus String?
 
   totalPrice    Decimal @db.Decimal(12, 2)
   currencyCode  String
@@ -152,8 +156,8 @@ model ErpPush {
   id       String @id @default(uuid())
   orderGid String
 
-  /// Sent to the ERP so it can deduplicate. Derived from the order GID and
-  /// attempt, NOT random — a random key on every retry defeats the purpose.
+  /// Sent to the ERP so it can deduplicate. Derived from the order GID,
+  /// NOT random — a random key on every retry defeats the purpose.
   idempotencyKey String @unique
 
   /// attempting | confirmed | failed | unknown
@@ -170,4 +174,32 @@ model ErpPush {
 
   @@index([orderGid, status])
   @@index([status, startedAt])
+}
+
+/// One row per reconciliation run. Makes drift trends visible: a single
+/// mismatch is noise, a rising count is a systemic problem.
+model ReconciliationRun {
+  id         String    @id @default(uuid())
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+
+  pushesChecked Int @default(0)
+  agreed        Int @default(0)
+
+  /// Local says confirmed, remote has no record.
+  missingRemote Int @default(0)
+
+  /// Local says unknown, remote has it — the lost-response case.
+  resolvedUnknown Int @default(0)
+
+  /// Local says unknown, remote does not have it — safe to retry.
+  confirmedFailed Int @default(0)
+
+  /// Remote has a record local knows nothing about.
+  orphanedRemote Int @default(0)
+
+  repaired Int     @default(0)
+  error    String?
+
+  @@index([startedAt])
 }
