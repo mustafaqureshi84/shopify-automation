@@ -61,6 +61,14 @@ ERP_URL=http://localhost:4000
 
 ## Running it
 
+### Tests
+
+```bash
+npm test                           # 28 tests, ~1s
+```
+
+Covers `retry.ts` (classification, backoff growth, `Retry-After` precedence, exhaustion), `webhook-verify.ts` (valid, wrong secret, tampered body, length mismatch, byte-exactness), and `idempotencyKey` (determinism, part-boundary collisions, format).
+
 ### Session startup — event layer
 
 Five processes. The tunnel URL changes on every restart, so each session begins by re-registering subscriptions.
@@ -164,6 +172,7 @@ ERP_MODE=ok|fail|flaky|slow|lost   # erp-stub.ts — failure injection
 | `src/erp-stub.ts` | Long-running: external system stand-in with failure injection |
 | `src/reconcile-erp.ts` | Compares local push records against the ERP; classifies and repairs |
 | `src/register-webhooks.ts` | Subscription management — deletes stale, creates current |
+| `src/*.test.ts` | Automated tests for the pure functions everything depends on |
 | Remaining `src/*.ts` | Batch scripts, reports, and test tooling |
 
 Dependencies flow one direction. `constants.ts`, `types.ts`, and `errors.ts` have no dependencies; scripts sit at the top.
@@ -320,15 +329,19 @@ Findings verified against a live development store, not taken from documentation
 
 **Flow can generate synthetic test events, including negative cases.** A workflow that fires when it should is half-verified; one that also stays quiet when it shouldn't is verified.
 
-### Prisma 7 specifics
+### Tooling specifics
 
-**The client no longer bundles a database driver.** `new PrismaClient({ adapter: new PrismaPg({ connectionString }) })`.
+**Prisma 7 no longer bundles a database driver.** `new PrismaClient({ adapter: new PrismaPg({ connectionString }) })`.
 
 **`prisma.config.ts` configures the CLI only.** The runtime connection is established in application code.
 
 **The generated client is TypeScript source at a configured `output` path.** Gitignored and rebuilt by `prisma generate`; `prisma/migrations/` is committed. `migrate dev` does not always emit it — run `prisma generate` explicitly.
 
 **ioredis needs a named import.** `import { Redis } from 'ioredis'` — the default export is the module namespace and is not constructable.
+
+**Node 22.18's MockTimers has no `tickAsync`.** The synchronous `tick` cannot advance past awaited promises inside a retry loop, so the retry tests use real timers with a 10–40ms base delay instead. Slower in principle, under a second in practice, and they test the actual timing code rather than a substitute for it.
+
+**Jittered timing must be asserted as a property, not a value.** The backoff test compares gap ratios rather than exact milliseconds, because asserting `gap === 2000` against 85–115% jitter would fail randomly. A test that fails intermittently is worse than no test.
 
 ## Measured behaviour
 
@@ -410,7 +423,7 @@ Plus development store: 20,000-point bucket, 1000/sec restore. Catalog of 2,017 
 
 13. **Bulk error paths are untested.** `FAILED`, `EXPIRED`, `partialDataUrl`, and timeout handling have never executed.
 
-14. **No automated tests.** Everything has been verified manually — broken credentials, unresolvable hosts, stubbed 429s, committed stock, catalog replacement, a fake required scope, four webhook signature modes, injected worker failures, mid-transaction failure, a lost ERP response, and cross-system drift — but none of it is repeatable without a human.
+14. **Only pure functions are tested.** `retry.ts`, `webhook-verify.ts`, and `idempotencyKey` have 28 automated tests covering classification, backoff growth, `Retry-After` precedence, and signature tampering. Everything with I/O — the Shopify client, the queue, handlers, sync, reconciliation — is verified manually and not repeatable without a human.
 
 ## Resolved
 
@@ -432,10 +445,10 @@ Plus development store: 20,000-point bucket, 1000/sec restore. Catalog of 2,017 
 - ~~Order data inaccessible~~ — protected customer data unlocked for development; five real orders captured as fixtures.
 - ~~Idempotency keys are random per call~~ — `idempotencyKey()` derives from operation identity; applied to inventory and ERP pushes.
 - ~~No reconciliation against the ERP~~ — four-verdict classification with selective repair.
+- ~~No automated tests~~ — 28 tests covering the three pure functions the rest of the system depends on. Runs in about a second.
 
 ## Roadmap
 
-- Automated tests for `retry.ts`, `webhook-verify.ts`, and `idempotencyKey`
 - Persist inventory levels per location
 - Scheduled reconciliation with alerting on unresolvable findings
 - Incremental sync with periodic full reconciliation
