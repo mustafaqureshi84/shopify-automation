@@ -453,3 +453,11 @@ Plus development store: 20,000-point bucket, 1000/sec restore. Catalog of 2,017 
 - Scheduled reconciliation with alerting on unresolvable findings
 - Incremental sync with periodic full reconciliation
 - Custom app: React Router 7, OAuth, Polaris, Flow triggers and actions
+
+## Related
+
+Built alongside [catalog-guard](https://github.com/mustafaqureshi84/catalog-guard) — a merchant-facing Shopify app applying these patterns to a product: supplier feed sync with field ownership locks, shadow mode, threshold-based risk scoring, a custom Flow trigger, and a checkout discount function compiled to WebAssembly.
+
+The two projects are deliberately different in shape. This one is headless — scripts and long-running processes that call Shopify from outside, where failures are recorded and a human reads the output. Catalog Guard is embedded, where the same failures have to be legible to a merchant who did not write the code and cannot read a log file.
+
+Several decisions carry over. Ambiguous outcomes are surfaced rather than resolved, in both the ERP reconciliation here and the duplicate-SKU handling there. Failures are recorded rather than skipped. Idempotency keys are derived from operation identity in both.
